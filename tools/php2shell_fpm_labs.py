@@ -220,6 +220,12 @@ def write_fpm_conf(version: str) -> str:
         "SAVEDIR": os.path.join(prefix, "session"),
         "VER": version,
     })
+    # Directives the build's FPM does not know would fail the config test:
+    # decorate_workers_output only exists from PHP 7.3 on.
+    if tuple(int(part) for part in version.split(".")) < (7, 3, 0):
+        rendered = "\n".join(
+            line for line in rendered.splitlines()
+            if not line.startswith("decorate_workers_output")) + "\n"
     path = os.path.join(prefix, "php-fpm.conf")
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(rendered)

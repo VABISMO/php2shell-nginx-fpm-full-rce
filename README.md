@@ -34,6 +34,7 @@ nginx security research, PHP session upload progress, exploitation laboratory.
 - [Verified output](#verified-output)
 - [Laboratory details](#laboratory-details)
 - [Profile and offsets](#profile-and-offsets)
+- [Session-file plant (PHP 5.4-8.x)](#session-file-plant-php-54-8x)
 - [HTTP-only base leak](#http-only-base-leak)
 - [Testing](#testing)
 - [CI/CD](#cicd)
@@ -122,15 +123,14 @@ reclaimed either — the slot at `chunk+0x89800` was measured intact after
 upload buffers of every matching Zend-MM class (2016/2000/1992/4071/4000/8000
 bytes) and after ~600 shape/header combinations.
 
-The PHP 5.4-7.x exposure described by the advisory comes from the *other*
-flaw (CVE-2026-109619's upload-progress logic: POST-body session-ID fixation
-plus unvalidated upload filenames), which this repository does not
-implement.
+The PHP 5.4-7.x exposure described by the advisory is the *other* side of
+`session.upload_progress`, and this repository implements it as the
+`poison` command (see [Session-file plant (PHP 5.4-8.x)](#session-file-plant-php-54-8x)).
 
 `php2shell_fpm_versions.has_session_cancel_decode()` detects this from the
-source tree or a release tarball, and `php2shell_fpm_matrix.py` classifies
-such builds as `chain n/a` instead of reporting them as failures. The
-remaining 7.x-specific support (the legacy five-pointer struct shape, the
+source tree or a release tarball, and `php2shell_fpm_matrix.py` runs `poison`
+on such builds instead of reporting them as failures. The remaining
+7.x-specific support (the legacy five-pointer struct shape, the
 `_zval_ptr_dtor` symbol alias, and the glibc build fixes in
 `lab/fpm/build_php.sh`) is kept so the laboratory can still run 7.2/7.4 for
 comparisons.
@@ -310,6 +310,7 @@ target you can only reach with requests.
 | --- | --- | --- | --- |
 | `calibrate` | Discover leak + reclaim geometry of any build | no | writes the profile; no arguments to feed |
 | `sweep` | Search the reclaim candidates of a build | no | keeps the profile leak geometry |
+| `poison` | Session-file plant: chosen bytes into a chosen `sess_<sid>` | no | the chain that works on PHP <= 7.x |
 | `leak` | Print chunk and PIE bases over HTTP | no | retries after worker death |
 | `no-oracle` | Full RCE without process memory | no | HTTP leak; no `/proc` fallback by default |
 | `endgame` | Oracle-calibrated full RCE | yes | local lab only |
@@ -468,6 +469,46 @@ Three phases, each validated by the answer of the target:
 The result is written into `profiles/<version>-fpm.json`, after which
 `no-oracle` reproduces the RCE against that build. `sweep` is the lighter
 variant: it keeps the leak geometry and only searches the reclaim candidates.
+
+## Session-file plant (PHP 5.4-8.x)
+
+The second half of `session.upload_progress` works on **every** version,
+including PHP <= 7.x where the struct-freeing chain does not apply:
+
+1. `MULTIPART_EVENT_FORMDATA` copies the session id **from the POST body**
+   without consulting `session.use_only_cookies`
+   (`ext/session/session.c`, `name_len == progress->sname_len` branch);
+2. `MULTIPART_EVENT_FILE_START` installs it as `PS(id)` and writes the
+   progress data there — carried by `session.upload_progress.cleanup=Off` on
+   the builder pool;
+3. the upload **filename** is stored as `current_file.name` and serialized
+   into that file, so chosen bytes land in a session file of the attacker's
+   choosing (`php_session_valid_key` limits the name to `[a-zA-Z0-9,-]`, so
+   the choice is inside `save_path`, not a path traversal);
+4. the application deserializes the file on its next `session_start()` and
+   reflects the contents — over HTTP, no `/proc` anywhere.
+
+```sh
+python3 tools/php2shell_fpm.py --version 7.4.33 \
+  --base http://127.0.0.1:8336 --builder http://127.0.0.1:8337 \
+  poison --sid poison7xtest01 --payload 'PLANTED_MARKER_7X_OK'
+```
+
+Verified output on 7.4.33:
+
+```
+[*] plant status=404 sid='poison7xtest01'
+[*] session file .../php-7.4.33/session/sess_poison7xtest01 (348 bytes)
+[*] application reflects the session: YES
+    ...b'0:"field_name";s:1:"f";s:4:"name";s:20:"PLANTED_MARKER_7X_OK";...'
+[+] plant VERIFIED
+```
+
+This is arbitrary **session-file write** pre-auth, not RCE by itself: core
+PHP serializes the filename with correct lengths, so turning the plant into
+code execution needs an application gadget or a local file include in the
+target. The `no-oracle` chain above is the one that reaches code execution
+with no application help, and it needs PHP >= 8.0.
 
 ## HTTP-only base leak
 
