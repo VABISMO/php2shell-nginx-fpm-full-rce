@@ -1,4 +1,4 @@
-.PHONY: help test lint validate ci build-nginx build-8.4.25 build-8.4.26 build-8.4.27 profile-draft labs-up labs-down labs-status labs-smoke labs-test
+.PHONY: help test lint validate ci build-nginx build-8.4.25 build-8.4.26 build-8.4.27 profile-draft calibrate-remote remote labs-up labs-down labs-status labs-smoke labs-test
 
 help:                          ## Show this help
 	@grep -E '^[a-zA-Z0-9_.-]+:.*##' $(MAKEFILE_LIST) | \
@@ -31,6 +31,20 @@ profile-draft:                 ## Generate a draft profile (PHP_FPM=... VERSION=
 	@test -n "$(PHP_FPM)" -a -n "$(VERSION)" || \
 	  (echo "usage: make profile-draft PHP_FPM=/path/to/php-fpm VERSION=8.4.25"; exit 2)
 	python3 tools/php2shell_fpm_profile.py --php-fpm "$(PHP_FPM)" --version "$(VERSION)"
+
+calibrate-remote:              ## Discover a profile over HTTP only (VERSION=... BASE=... BUILDER=...)
+	@test -n "$(VERSION)" || \
+	  (echo "usage: make calibrate-remote VERSION=8.2.34 BASE=http://127.0.0.1:8406 BUILDER=http://127.0.0.1:8407"; exit 2)
+	python3 tools/php2shell_fpm.py --version "$(VERSION)" \
+	  --base "$(BASE)" --builder "$(BUILDER)" calibrate
+
+remote:                        ## Run the 100%-remote chain (VERSION=... BASE=... BUILDER=...)
+	@test -n "$(VERSION)" || \
+	  (echo "usage: make remote VERSION=8.2.34 BASE=http://127.0.0.1:8406 BUILDER=http://127.0.0.1:8407"; exit 2)
+	python3 tools/php2shell_fpm.py --version "$(VERSION)" \
+	  --base "$(BASE)" --builder "$(BUILDER)" \
+	  --command "id>out/remote-$(VERSION)" --proof-file "out/remote-$(VERSION)" \
+	  no-oracle
 
 labs-up:                       ## Start the local nginx+FPM labs
 	python3 tools/php2shell_fpm_labs.py up

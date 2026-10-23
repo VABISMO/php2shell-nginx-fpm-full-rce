@@ -43,7 +43,7 @@
   "status": "Draft profile: symbols extracted with nm and struct layouts derived from the build headers/source; allocator, reclaim, no-oracle, and leak geometry copied from the template and NOT calibrated. Run leak/primitive/endgame in a lab and update the geometry and verified flags before trusting this profile.",
   "oom_mb": 4,
   "layout": {
-    "unserialize_data": {"last": 0, "first_dtor": 8, "last_dtor": 16, "allowed_classes": 24, "ref_props": 32, "cur_depth": 40, "max_depth": 48, "entries": 56, "size": 8216},
+    "unserialize_data": {"last": 0, "first_dtor": 8, "last_dtor": 16, "allowed_classes": 24, "ref_props": 32, "cur_depth": 40, "max_depth": 48, "entries": 56, "size": 8216, "legacy": false},
     "var_entries": {"used_slots": 0, "next": 8, "data": 16, "max": 1018},
     "zval": {"value": 0, "type_info": 8, "context": 12, "size": 16},
     "zend_array": {"gc": 0, "flags": 8, "nTableMask": 12, "arData": 16, "nNumUsed": 24, "nNumOfElements": 28, "nTableSize": 32, "pDestructor": 48},

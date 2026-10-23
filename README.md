@@ -64,18 +64,53 @@ operation must match the model.
 
 ## Affected builds
 
+Upstream fixed the bug on 2026-10-21 with `php_basic_early_rinit()`, called
+from `php_request_startup()` *before* the request body is parsed, which
+memsets `BG(unserialize)`:
+
+| Branch | Vulnerable | Fixed | Status in this repository |
+| --- | --- | --- | --- |
+| 8.5 | 8.5.0 – 8.5.11 | 8.5.12 | lab build + remote calibration |
+| 8.4 | 8.4.0 – 8.4.26 | 8.4.27 | **verified profiles (8.4.25, 8.4.26)** |
+| 8.3 | 8.3.0 – 8.3.35 | 8.3.36 | lab build + remote calibration |
+| 8.2 | 8.2.0 – 8.2.34 | 8.2.35 | lab build + remote calibration |
+| 8.1 and older (7.x, 5.x) | every release | **never patched** | lab build + remote calibration |
+
+`tools/php2shell_fpm_versions.py` is the single source of truth for that
+matrix: `is_vulnerable()`, `fixed_in()`, `affected_versions()`, and
+`source_is_fixed()` (which classifies a tarball by the presence of the fix
+marker instead of trusting a version string).
+
 | Item | Value |
 | --- | --- |
-| Vulnerable builds | PHP 8.4.25 and 8.4.26, amd64, nginx + PHP-FPM |
-| Fixed build | PHP 8.4.27 (`PHP_RINIT(basic)` clears the stale state) |
+| Vulnerable builds | any release of the branches above, amd64, nginx + PHP-FPM |
+| Fixed builds | 8.2.35, 8.3.36, 8.4.27, 8.5.12 (`patchcheck` shows them clean) |
 | SAPI | `fpm` only |
-| Profiles | `profiles/8.4.25-fpm.json`, `profiles/8.4.26-fpm.json` |
+| Profiles | `profiles/<version>-fpm.json`; verified ones carry `"rce": true` |
 | Runtime proof | `uid=1000(...)` from `id` in the FPM worker |
 | Worker impact | one consumer worker aborts after the command; FPM respawns it |
 | Expected HTTP result | `502` after the fire; the proof file is the reliable signal |
 
-The verified profiles are Debian-style, user-prefix PHP 8.4.25/8.4.26 builds.
-Another distribution, architecture, or patch level needs its own offsets.
+The verified profiles are Debian-style, user-prefix PHP builds compiled by
+`lab/fpm/build_php.sh`. Another distribution, architecture, or patch level
+needs its own offsets; `calibrate` derives them over HTTP (see
+[Remote calibration](#remote-calibration-of-any-version)).
+
+### Legacy branches (PHP 7.x)
+
+PHP 7.x never received a fix, so every 7.x release is vulnerable. Two
+build- and layout-level differences are handled for you:
+
+- `lab/fpm/build_php.sh` fixes the two places 7.x mis-detects modern glibc
+  (the POSIX three-argument `readdir_r()` and the `fopencookie` seek
+  handler), so 7.2/7.4 build with a current toolchain;
+- PHP <= 7.3 keeps `php_unserialize_data` as five pointers with the
+  `var_entries` blocks allocated separately, and PHP <= 7.2 exports
+  `_zval_ptr_dtor` (with an underscore). The profile generator parses both
+  shapes from the source tree and records `"legacy": true`, and the payload
+  builder forges the matching structure: the fake `var_entries` starts at
+  the head of the reclaim buffer, which is also the block PHP 7's
+  `var_destroy()` frees.
 
 ## How the chain works
 
@@ -234,8 +269,13 @@ python3 tools/php2shell_fpm_labs.py down
 
 ## Exploit modes
 
+The remote path is the product; every command in it works over HTTP against a
+target you can only reach with requests.
+
 | Command | Purpose | `/proc/<pid>/mem` | Notes |
 | --- | --- | --- | --- |
+| `calibrate` | Discover leak + reclaim geometry of any build | no | writes the profile; no arguments to feed |
+| `sweep` | Search the reclaim candidates of a build | no | keeps the profile leak geometry |
 | `leak` | Print chunk and PIE bases over HTTP | no | retries after worker death |
 | `no-oracle` | Full RCE without process memory | no | HTTP leak; no `/proc` fallback by default |
 | `endgame` | Oracle-calibrated full RCE | yes | local lab only |
@@ -358,11 +398,42 @@ python3 tools/php2shell_fpm_profile.py \
 ```
 
 The generator extracts `zif_system`, `zval_ptr_dtor`, and `basic_globals` with
-`nm` and copies the remaining geometry from `profiles/8.4.26-fpm.json`. The
-result is always `verified: false` / `rce: false`: calibrate it with `leak`,
-`primitive`, and `endgame` before trusting it. PHP 8.5.11 was evaluated but its
-allocator layout did not reproduce the HTTP leak with this geometry, so it is
-not shipped as a supported profile. The schema documents the expected shape.
+`nm`, compiles `tools/php2shell_fpm_offsets.c` against the build's own headers
+for the struct layouts, and parses `php_unserialize_data` from the source tree
+(PHP <= 7.3 gets the `legacy` five-pointer shape). The result is always
+`verified: false` / `rce: false`: symbols and layouts do not prove the heap
+geometry, so run `calibrate` before trusting it.
+
+## Remote calibration of any version
+
+`calibrate` derives everything a profile needs **with HTTP requests only** —
+no `/proc`, no local shell, no FPM PID. It is the same traffic the exploit
+sends, so a build that calibrates is a build that exploits:
+
+```sh
+python3 tools/php2shell_fpm.py \
+  --version 8.2.34 \
+  --base http://127.0.0.1:8406 --builder http://127.0.0.1:8407 \
+  calibrate
+```
+
+Three phases, each validated by the answer of the target:
+
+1. **Leak geometry** — the forged `zend_string` header is tried at a few
+   content offsets; a geometry is accepted when two consecutive OOB reads
+   expose a chunk pointer and a PIE pointer at the *same* offsets. The chunk
+   base is 2 MB aligned, which fixes `chunk_base_off` on its own.
+2. **Reclaim geometry** — the primitive (a forged `IS_LONG` zval reflected by
+   `app.php`) needs no PIE base, so it isolates the heap geometry: the sweep
+   walks pad/size shapes and `(chunk offset, content offset)` pairs until the
+   value comes back in the response.
+3. **PIE base** — the leaked pointer is rounded down to 2 MB boundaries and
+   each candidate is proven with a remote endgame until the proof file
+   appears.
+
+The result is written into `profiles/<version>-fpm.json`, after which
+`no-oracle` reproduces the RCE against that build. `sweep` is the lighter
+variant: it keeps the leak geometry and only searches the reclaim candidates.
 
 ## HTTP-only base leak
 
@@ -535,9 +606,11 @@ not a generic unauthenticated scanner.
 
 ### Configurations this PoC covers without code changes
 
-- **PHP 8.4.25 or 8.4.26, amd64, nginx + PHP-FPM.** The verified offsets are in
-  `profiles/8.4.25-fpm.json` and `profiles/8.4.26-fpm.json`. PHP 8.4.27 is fixed
-  and is not covered. PHP 8.5.x needs a separate calibrated profile.
+- **Any vulnerable release of the tracked branches, amd64, nginx + PHP-FPM.**
+  Verified profiles are in `profiles/<version>-fpm.json`; the fix landed in
+  8.2.35, 8.3.36, 8.4.27, and 8.5.12, and PHP 8.1 and older (7.x included) was
+  never patched. A build without a profile is covered after one `calibrate`
+  run against it.
 - **Default session serializer and storage:** `session.serialize_handler=php`
   and `session.save_handler=files`, with a writable session directory shared by
   the arm/builder and consumer surfaces.
@@ -630,9 +703,10 @@ No. `PHP_RINIT(basic)` clears the stale state before the window; `patchcheck`
 shows the fixed build as clean.
 
 **Does it work on PHP 8.5.x?**<br>
-Not with the shipped profiles. PHP 8.5.11 was evaluated during the 8.4.25
-calibration; its allocator layout did not reproduce the HTTP leak with this
-geometry, so only 8.4.25 and 8.4.26 are claimed as verified.
+Yes, from 8.5.0 to 8.5.11 (8.5.12 carries the fix). The chain does not depend
+on the branch: `calibrate` derives the leak and reclaim geometry of any build
+over HTTP, and the payload uses the struct layouts of that build's own
+headers.
 
 **Can I set the bases manually?**<br>
 Yes:

@@ -144,8 +144,10 @@
       "properties": {
         "unserialize_data": {
           "type": "object",
-          "required": ["last", "entries", "size"],
+          "description": "php_unserialize_data; PHP <= 7.3 keeps a 'legacy' five-pointer shape with no embedded entries block",
+          "required": ["last", "size"],
           "properties": {
+            "first": {"type": "integer", "minimum": 0},
             "last": {"type": "integer", "minimum": 0},
             "first_dtor": {"type": "integer", "minimum": 0},
             "last_dtor": {"type": "integer", "minimum": 0},
@@ -154,7 +156,8 @@
             "cur_depth": {"type": "integer", "minimum": 0},
             "max_depth": {"type": "integer", "minimum": 0},
             "entries": {"type": "integer", "minimum": 0},
-            "size": {"type": "integer", "minimum": 1}
+            "size": {"type": "integer", "minimum": 1},
+            "legacy": {"type": "boolean"}
           },
           "additionalProperties": false
         },

