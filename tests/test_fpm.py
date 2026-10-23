@@ -15,6 +15,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
@@ -54,6 +55,38 @@ class LeakTests(unittest.TestCase):
         self.assertEqual(g["read_len"], 0x15810)
         self.assertEqual(g["chunk_ptr_off"], 0x77F8)
         self.assertEqual(g["pie_ptr_off"], 0x157E8)
+
+
+class NoOracleRemoteModeTests(unittest.TestCase):
+    """--no-oracle must not silently read local /proc when remote."""
+
+    def _args(self, **extra):
+        base = dict(
+            base="http://127.0.0.1:1",
+            builder="http://127.0.0.1:2",
+            version="8.4.26",
+            chunk=0,
+            pie=0,
+            allow_local_fallback=False,
+        )
+        base.update(extra)
+        return SimpleNamespace(**base)
+
+    def test_http_leak_failure_does_not_use_local_fallback(self):
+        with mock.patch.object(fpm, "leak_bases_http",
+                               side_effect=RuntimeError("offline")), \
+             mock.patch.object(fpm, "_local_bases") as local:
+            self.assertEqual(fpm.cmd_no_oracle(self._args()), 1)
+            local.assert_not_called()
+
+    def test_local_fallback_requires_explicit_opt_in(self):
+        with mock.patch.object(fpm, "leak_bases_http",
+                               side_effect=RuntimeError("offline")), \
+             mock.patch.object(fpm, "_local_bases",
+                               side_effect=RuntimeError("no lab")) as local:
+            self.assertEqual(
+                fpm.cmd_no_oracle(self._args(allow_local_fallback=True)), 1)
+            local.assert_called_once_with("8.4.26")
 
 
 class EndgamePayloadTests(unittest.TestCase):

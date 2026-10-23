@@ -232,7 +232,7 @@ python3 tools/php2shell_fpm_labs.py down
 | Command | Purpose | `/proc/<pid>/mem` | Notes |
 | --- | --- | --- | --- |
 | `leak` | Print chunk and PIE bases over HTTP | no | retries after worker death |
-| `no-oracle` | Full RCE without process memory | no | default bases come from `leak` |
+| `no-oracle` | Full RCE without process memory | no | HTTP leak; no `/proc` fallback by default |
 | `endgame` | Oracle-calibrated full RCE | yes | local lab only |
 | `primitive` | Benign forged `var_entries`, observable via `app.php` | yes | useful calibration test |
 | `patchcheck` | Compare 8.4.26 and 8.4.27 | yes | proves the fixed build is clean |
@@ -243,7 +243,8 @@ python3 tools/php2shell_fpm_labs.py down
 | `build-oom` / `build-ref` | Build sessions directly | no | builder diagnostics |
 
 Both `leak` and `no-oracle` accept `--chunk 0x...` and `--pie 0x...` overrides.
-Local `/proc/<pid>/maps` is used only as a fallback when the HTTP leak fails.
+`no-oracle` fails if the HTTP leak fails; it does not touch local `/proc` unless
+you explicitly add `--allow-local-fallback` (lab-only).
 
 ## Verified output
 
@@ -433,8 +434,9 @@ worker to the other heap slot and the next candidate.
 
 The worker may have died between the leak read and the response, or the heap
 layout may have shifted. Retry `leak`; the state is re-armed each run. If you
-already know the bases, pass `--chunk` and `--pie`. In the local lab,
-`/proc/<pid>/maps` is the fallback.
+already know the bases, pass `--chunk` and `--pie`. For the local lab only,
+`no-oracle --allow-local-fallback` permits the `/proc/<pid>/maps` fallback;
+remote targets should retry or provide the bases.
 
 ### `no php-fpm 'chain' worker`
 
@@ -493,8 +495,9 @@ surfaces. It does not read `/proc/<pid>/mem`, does not need a local shell or the
 FPM PID, and executes the command in the target worker. The HTTP stale-string
 leak recovers the ASLR bases.
 
-If the HTTP leak fails, there is no remote fallback. The local
-`/proc/<pid>/maps` fallback is only for the lab; on a remote target, retry the
+If the HTTP leak fails, `no-oracle` stops; it does **not** silently read local
+`/proc`. The `/proc/<pid>/maps` fallback is opt-in with
+`--allow-local-fallback` and is only for the lab. On a remote target, retry the
 leak or provide the bases with `--chunk/--pie`. This is remote code execution,
 not a generic unauthenticated scanner.
 
@@ -601,8 +604,8 @@ python3 tools/php2shell_fpm.py ... --chunk 0x7f4f48800000 --pie 0x55d75fc00000 n
 ```
 
 **Does the leak need `/proc`?**<br>
-No. The default `leak`/`no-oracle` path is HTTP-only. `/proc/<pid>/maps` is
-only a local fallback.
+No. The default `leak`/`no-oracle` path is HTTP-only; `no-oracle` refuses the
+local fallback unless you explicitly pass `--allow-local-fallback` (lab-only).
 
 ## Legal and responsible use
 
