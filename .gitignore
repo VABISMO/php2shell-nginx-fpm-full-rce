@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+lab/fpm/runtime/
+lab/fpm/webroot/out/

@@ -1,0 +1,33 @@
+[project]
+name = "php2shell-nginx-fpm-full-rce"
+version = "1.0.0"
+description = "PHP 8.4.26 nginx + PHP-FPM stale-unserialize RCE laboratory"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+keywords = ["security", "research", "php", "php-fpm", "rce"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Information Technology",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[tool.setuptools]
+packages = []
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
