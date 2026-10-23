@@ -169,6 +169,20 @@ class EndgamePayloadTests(unittest.TestCase):
         self.assertEqual(self.buf[self._off(D + 0x898) + len(CMD)], 0)
 
 
+class PathConfigTests(unittest.TestCase):
+    def test_cookie_name_and_custom_paths(self):
+        args = SimpleNamespace(app_path="/index.php", arm_path="/arm.php",
+                               ref_path="/session.php", probe_path="/404",
+                               session_cookie="MYSESSID")
+        with mock.patch.dict(fpm.PATHS, {
+                "app": "/app.php", "arm": "/bigvar.php", "ref": "/ref.php",
+                "probe": "/nope.php", "cookie": "PHPSESSID"}):
+            fpm.configure_paths(args)
+            self.assertEqual(fpm.PATHS["app"], "/index.php")
+            self.assertEqual(fpm.PATHS["cookie"], "MYSESSID")
+            self.assertEqual(fpm._cookie(b"abc"), b"MYSESSID=abc")
+
+
 class OracleChunkTests(unittest.TestCase):
     def test_chunk_base_handles_merged_anonymous_mapping(self):
         oracle = object.__new__(fpm.Oracle)

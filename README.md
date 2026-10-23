@@ -250,6 +250,12 @@ Both `leak` and `no-oracle` accept `--chunk 0x...` and `--pie 0x...` overrides.
 `no-oracle` fails if the HTTP leak fails; it does not touch local `/proc` unless
 you explicitly add `--allow-local-fallback` (lab-only).
 
+The application/builder surface names are configurable without editing code:
+`--app-path` (default `/app.php`), `--arm-path` (default profile leak arm),
+`--ref-path` (default `/ref.php`), `--probe-path` (404/no-op reclaim probe,
+default `/nope.php`), and `--session-cookie` (default `PHPSESSID`). The target
+application must still provide the session operations described below.
+
 ## Verified output
 
 Reference run on the local 8.4.26 lab:
