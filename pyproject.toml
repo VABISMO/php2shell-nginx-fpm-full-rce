@@ -1,7 +1,7 @@
 [project]
 name = "php2shell-nginx-fpm-full-rce"
 version = "1.0.0"
-description = "PHP 8.4.26 nginx + PHP-FPM stale-unserialize RCE laboratory"
+description = "PHP 8.4.25/8.4.26 nginx + PHP-FPM stale-unserialize RCE laboratory"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

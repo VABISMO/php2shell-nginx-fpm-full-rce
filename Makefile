@@ -1,4 +1,4 @@
-.PHONY: help test lint validate ci build-nginx build-8.4.26 build-8.4.27 labs-up labs-down labs-status labs-smoke labs-test
+.PHONY: help test lint validate ci build-nginx build-8.4.25 build-8.4.26 build-8.4.27 labs-up labs-down labs-status labs-smoke labs-test
 
 help:                          ## Show this help
 	@grep -E '^[a-zA-Z0-9_.-]+:.*##' $(MAKEFILE_LIST) | \
@@ -10,13 +10,16 @@ test:                          ## Run the unit test suite
 lint:                          ## Run ruff
 	ruff check tools tests
 
-validate:                      ## Validate the FPM profile against its schema
-	python3 -c "import json, jsonschema; jsonschema.validate( 	  json.load(open('profiles/8.4.26-fpm.json')), 	  json.load(open('profiles/schema.json'))); print('profile valid')"
+validate:                      ## Validate all FPM profiles against the schema
+	python3 -c "import glob, json, jsonschema; s = json.load(open('profiles/schema.json')); [jsonschema.validate(json.load(open(p)), s) for p in glob.glob('profiles/*-fpm.json')]; print('profiles valid')"
 
 ci: lint test validate         ## Run the fast CI checks locally
 
 build-nginx:                   ## Build nginx into lab/fpm/runtime
 	lab/fpm/build_nginx.sh
+
+build-8.4.25:                  ## Build vulnerable PHP 8.4.25
+	lab/fpm/build_php.sh 8.4.25
 
 build-8.4.26:                  ## Build vulnerable PHP 8.4.26
 	lab/fpm/build_php.sh 8.4.26

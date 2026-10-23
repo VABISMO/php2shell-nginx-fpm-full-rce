@@ -3,6 +3,7 @@
 php2shell_fpm_labs.py — local nginx + PHP-FPM laboratory (no root, no docker).
 
 Two user-prefix builds share one nginx:
+    8.4.25  chain http :8130 -> fpm :9021   builder http :8131 -> fpm :9022
     8.4.26  chain http :8110 -> fpm :9001   builder http :8111 -> fpm :9002
     8.4.27  chain http :8120 -> fpm :9011   builder http :8121 -> fpm :9012
 
@@ -52,6 +53,7 @@ GROUP_NAME = subprocess.run(
 
 # version -> (chain_http, builder_http, chain_fpm, builder_fpm)
 BUILDS: dict[str, tuple[int, int, int, int]] = {
+    "8.4.25": (8130, 8131, 9021, 9022),
     "8.4.26": (8110, 8111, 9001, 9002),
     "8.4.27": (8120, 8121, 9011, 9012),
 }
@@ -204,8 +206,8 @@ def up(only: set[str] | None) -> None:
     for version in versions:
         write_fpm_conf(version)
     os.makedirs(os.path.join(RUNTIME, "logs"), exist_ok=True)
-    # full conf (all versions) so nginx stays the single front
-    write_nginx_conf(list(BUILDS))
+    # only expose the versions that are running; a later `up --only` rewrites it
+    write_nginx_conf(versions)
 
     busy = []
     for version in versions:
