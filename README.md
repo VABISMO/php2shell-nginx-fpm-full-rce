@@ -38,7 +38,7 @@ nginx security research, PHP session upload progress, exploitation laboratory.
 - [Testing](#testing)
 - [CI/CD](#cicd)
 - [Troubleshooting](#troubleshooting)
-- [Security model and limitations](#security-model-and-limitations)
+- [Security model, remote scope, and limitations](#security-model-remote-scope-and-limitations)
 - [FAQ](#faq)
 - [Legal and responsible use](#legal-and-responsible-use)
 - [Credits](#credits)
@@ -483,29 +483,98 @@ The nginx root is the repository's `lab/fpm/webroot`. Re-run
 `python3 tools/php2shell_fpm_labs.py up` so nginx and FPM configs are rendered
 with the current paths. Do not move the webroot independently of the launcher.
 
-## Security model and limitations
+## Security model, remote scope, and limitations
+
+### What "100% remote" means here
+
+The `no-oracle` path is **100% remote for the supported configuration below**:
+every interaction with the target is an HTTP request to the chain and builder
+surfaces. It does not read `/proc/<pid>/mem`, does not need a local shell or the
+FPM PID, and executes the command in the target worker. The HTTP stale-string
+leak recovers the ASLR bases.
+
+If the HTTP leak fails, there is no remote fallback. The local
+`/proc/<pid>/maps` fallback is only for the lab; on a remote target, retry the
+leak or provide the bases with `--chunk/--pie`. This is remote code execution,
+not a generic unauthenticated scanner.
+
+### Configurations this PoC covers without code changes
+
+- **PHP 8.4.26, amd64, nginx + PHP-FPM.** The verified offsets are in
+  `profiles/8.4.26-fpm.json`. PHP 8.4.27 is fixed and is not covered.
+- **Default session serializer and storage:** `session.serialize_handler=php`
+  and `session.save_handler=files`, with a writable session directory shared by
+  the arm/builder and consumer surfaces.
+- **Two HTTP surfaces with different memory limits:** a consumer pool low
+  enough that decoding the 4 MB session OOMs after RINIT, and a builder
+  surface high enough to persist the 4 MB arm. This can be two FPM pools on one
+  host or two hosts sharing the session directory.
+- **Single-worker pools, or reliable worker pinning.** The stale
+  `BG(unserialize)` state lives in the worker that handled the producer
+  request. With several workers and no pinning, the consumer request can land
+  on a different worker. `pm.max_requests` must not recycle that worker between
+  the arm and the fire.
+- **An application operation that calls `session_start()`** and lets the
+  session decode after RINIT. `lab/fpm/webroot/app.php` is the stand-in.
+- **An arm operation equivalent to `bigvar.php`**: small session keys are
+  pushed onto the unserialize var_hash before a 4 MB tail triggers the OOM.
+  A generic session write that only stores one large value is not enough.
+- **A reference-bearing session equivalent to `ref.php`**: the application can
+  store a reference in the session, so the serialized session contains `R:N`;
+  that is the hook the forged `var_hash` redirects.
+- **A builder operation that writes and retains the 4 MB session**, for example
+  `session.upload_progress.cleanup=Off` on the builder, or an application-level
+  session write. `session.upload_progress.enabled=On` and body limits large
+  enough for the 4 MB arm and 16 KB trigger are required.
+- **`session.use_strict_mode=0`**, or an existing attacker-known session ID
+  accepted by the application, and no session-ID regeneration between the arm
+  and the fire. Strict mode or regeneration can break the chain before it
+  starts.
+- **A reflection/read channel for the leaked `r` value.** `app.php` provides
+  it for the lab. Without it, `leak` cannot recover ASLR remotely; `no-oracle`
+  then needs known `--chunk/--pie` values.
+- **An HTTP-reachable proof path**, or another authorized exfiltration channel.
+  `out/p1` and `/out/` are lab conveniences, not a requirement of the memory
+  corruption itself. The command is limited to 87 bytes with no NUL.
+
+### Configurations that need adaptation or do not work
+
+- PHP 8.4.27, or another PHP version/architecture without a matching profile.
+  The bug may still be relevant elsewhere, but this repository's offsets and
+  heap geometry are only verified for 8.4.26 amd64.
+- A single low-memory pool: the 4 MB arm kills the consumer before the trigger.
+- Redis/Memcached/custom session handlers, `php_serialize`, or session storage
+  that is not shared between the two surfaces.
+- A single pool with many workers and no way to pin the producer and consumer
+  to the same worker. The state is not shared between workers.
+- No application session-start operation, no way to persist the arm, or no
+  session reflection/read channel and unknown bases.
+- Apache `mod_php`, CGI, CLI, or non-FPM SAPIs. This is an FPM chain.
+- Interactive shells or persistence. The command is one-shot, the carrier is
+  87 bytes, and the consumer worker aborts after `zif_system`; FPM respawns it.
+  A `502` is the expected side effect.
+
+### Operational limits
 
 - **Authorized labs only.** The chain is destructive to workers and allocates
   large bodies. Do not point it at third-party infrastructure.
-- **Application requirement.** The target needs a session-starting operation
-  and a session reflection/leak channel. `app.php` is a lab stand-in.
-- **Two pools.** The arm and consumer endpoints must be separated; a single
-  8 MB pool is not enough for the 4 MB arm.
-- **One profile.** The verified offsets are for PHP 8.4.26 amd64. PHP 8.4.27
-  clears the stale state at RINIT and is not vulnerable to this chain.
-- **One worker dies.** The consumer worker aborts after `zif_system`; FPM
-  respawns it. A `502` is the expected side effect.
-- **Command limit.** The carrier string holds at most 87 command bytes and no
-  NUL.
 - **Leak reliability.** The OOB read can race worker death; the client retries.
   The bases remain stable for the FPM master lifetime.
+- **Local oracle modes.** `endgame` and `primitive` read `/proc/<pid>/mem` and
+  need `kernel.yama.ptrace_scope=0`; `no-oracle` does not.
+
+This is a concrete, verified PoC, not a claim that every PHP-FPM 8.4.26
+deployment is exploitable with no adaptation. The underlying bug may affect
+more configurations than this client covers.
 
 ## FAQ
 
 **Is this a remote pre-auth exploit?**<br>
-It is a remote-style session deserialization chain, but it requires the
-application operation and builder/session endpoints. It is not a generic
-unauthenticated scanner. The included lab is loopback-only.
+It is 100% remote in the supported model: all target interaction is HTTP and
+`no-oracle` does not read `/proc`. It is not pre-auth or universal: it requires
+the application operations, two surfaces, and session configuration listed in
+[Security model, remote scope, and limitations](#security-model-remote-scope-and-limitations).
+The included lab is loopback-only.
 
 **Why is the proof a `502`?**<br>
 The command runs during session shutdown, then the fake destructor chain kills
