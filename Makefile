@@ -1,4 +1,4 @@
-.PHONY: help test build-nginx build-8.4.26 build-8.4.27 labs-up labs-down labs-status labs-smoke labs-test
+.PHONY: help test lint validate ci build-nginx build-8.4.26 build-8.4.27 labs-up labs-down labs-status labs-smoke labs-test
 
 help:                          ## Show this help
 	@grep -E '^[a-zA-Z0-9_.-]+:.*##' $(MAKEFILE_LIST) | \
@@ -6,6 +6,14 @@ help:                          ## Show this help
 
 test:                          ## Run the unit test suite
 	python3 -m unittest discover -s tests -v
+
+lint:                          ## Run ruff
+	ruff check tools tests
+
+validate:                      ## Validate the FPM profile against its schema
+	python3 -c "import json, jsonschema; jsonschema.validate( 	  json.load(open('profiles/8.4.26-fpm.json')), 	  json.load(open('profiles/schema.json'))); print('profile valid')"
+
+ci: lint test validate         ## Run the fast CI checks locally
 
 build-nginx:                   ## Build nginx into lab/fpm/runtime
 	lab/fpm/build_nginx.sh

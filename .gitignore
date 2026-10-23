@@ -3,3 +3,8 @@ __pycache__/
 .DS_Store
 lab/fpm/runtime/
 lab/fpm/webroot/out/
+
+.ruff_cache/
+*.egg-info/
+build/
+dist/

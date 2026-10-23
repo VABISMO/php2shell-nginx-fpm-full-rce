@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 php2shell_fpm_labs.py — local nginx + PHP-FPM laboratory (no root, no docker).
 
@@ -22,6 +21,7 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import pwd
 import signal
@@ -66,7 +66,8 @@ def fpm_bin(version: str) -> str:
 
 
 def render(template: str, mapping: dict[str, str]) -> str:
-    text = open(template, encoding="utf-8").read()
+    with open(template, encoding="utf-8") as handle:
+        text = handle.read()
     for key, value in mapping.items():
         text = text.replace(f"@{key}@", value)
     return text
@@ -84,7 +85,8 @@ def port_free(port: int) -> bool:
 
 def read_pid(path: str) -> int | None:
     try:
-        pid = int(open(path, encoding="utf-8").read().strip())
+        with open(path, encoding="utf-8") as handle:
+            pid = int(handle.read().strip())
     except (OSError, ValueError):
         return None
     try:
@@ -116,10 +118,8 @@ def ensure_dirs(version: str) -> None:
     for sub in ("logs", "session", "tmp"):
         os.makedirs(os.path.join(prefix, sub), exist_ok=True)
     os.makedirs(OUTDIR, exist_ok=True)
-    try:
+    with contextlib.suppress(OSError):
         os.chmod(os.path.join(prefix, "session"), 0o700)
-    except OSError:
-        pass
 
 
 def write_fpm_conf(version: str) -> str:
@@ -300,10 +300,8 @@ def down() -> None:
             else:
                 os.kill(master, signal.SIGKILL)
         for pid in worker_pids(version, "chain") + worker_pids(version, "builder"):
-            try:
+            with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
     print("[+] lab down")
 
 
@@ -351,10 +349,8 @@ def test() -> None:
     for version in BUILDS:
         chain_http, _b, _c, _f = BUILDS[version]
         proof = os.path.join(OUTDIR, "p1")
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(proof)
-        except OSError:
-            pass
         cmd = [
             sys.executable, os.path.join(HERE, "php2shell_fpm.py"),
             "chain",
@@ -368,9 +364,10 @@ def test() -> None:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
         print((result.stdout + result.stderr).strip(), flush=True)
         if result.returncode == 0 and os.path.isfile(proof):
-            results.append((version, "RCE", open(proof, encoding="utf-8").read().strip()))
+            with open(proof, encoding="utf-8") as handle:
+                results.append((version, "RCE", handle.read().strip()))
         else:
-            results.append((version, "no RCE (exit %d)" % result.returncode, ""))
+            results.append((version, f"no RCE (exit {result.returncode})", ""))
     print("\n=== summary ===")
     for version, text, proof in results:
         print(f"  {version:8} {text:24} {proof}")

