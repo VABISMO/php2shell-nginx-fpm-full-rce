@@ -925,6 +925,12 @@ def leak_bases_http(base_url: str, builder_url: str, version: str,
     for attempt in range(10):
         if attempt:
             time.sleep(0.25)
+        # A reset request after a killed worker clears stale session/lock
+        # state; without it a post-fire leak can fail on an otherwise healthy
+        # respawned worker.
+        with contextlib.suppress(OSError):
+            ref_session_post(builder, REF_SID)
+            app.get(PATHS["app"], cookie=_cookie(REF_SID))
         try:
             builder.get(arm_path, cookie=_cookie(OOM_SID))
             chain.get(PATHS["app"], cookie=_cookie(OOM_SID))
