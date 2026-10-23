@@ -1,4 +1,4 @@
-.PHONY: help test lint validate ci build-nginx build-8.4.25 build-8.4.26 build-8.4.27 labs-up labs-down labs-status labs-smoke labs-test
+.PHONY: help test lint validate ci build-nginx build-8.4.25 build-8.4.26 build-8.4.27 profile-draft labs-up labs-down labs-status labs-smoke labs-test
 
 help:                          ## Show this help
 	@grep -E '^[a-zA-Z0-9_.-]+:.*##' $(MAKEFILE_LIST) | \
@@ -26,6 +26,11 @@ build-8.4.26:                  ## Build vulnerable PHP 8.4.26
 
 build-8.4.27:                  ## Build fixed PHP 8.4.27 (patchcheck)
 	lab/fpm/build_php.sh 8.4.27
+
+profile-draft:                 ## Generate a draft profile (PHP_FPM=... VERSION=...)
+	@test -n "$(PHP_FPM)" -a -n "$(VERSION)" || \
+	  (echo "usage: make profile-draft PHP_FPM=/path/to/php-fpm VERSION=8.4.25"; exit 2)
+	python3 tools/php2shell_fpm_profile.py --php-fpm "$(PHP_FPM)" --version "$(VERSION)"
 
 labs-up:                       ## Start the local nginx+FPM labs
 	python3 tools/php2shell_fpm_labs.py up

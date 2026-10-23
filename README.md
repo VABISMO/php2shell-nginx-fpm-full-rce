@@ -153,6 +153,7 @@ short-session string into an OOB read primitive for ASLR bases.
 ├── tests/test_fpm.py          unit + opt-in live tests
 ├── tools/
 │   ├── php2shell_fpm.py       exploit client
+│   ├── php2shell_fpm_profile.py  draft profile generator
 │   └── php2shell_fpm_labs.py  user-prefix nginx/FPM launcher
 ├── Makefile
 ├── requirements-dev.txt
@@ -347,7 +348,19 @@ python3 -c "import glob, json, jsonschema; \
 ```
 
 Another PHP build or distro needs a new profile with its own symbols, struct
-size, heap geometry, and leak offsets. PHP 8.5.11 was evaluated but its
+size, heap geometry, and leak offsets. Generate a draft from an unstripped
+`php-fpm` binary:
+
+```sh
+python3 tools/php2shell_fpm_profile.py \
+  --php-fpm lab/fpm/runtime/php-8.4.25/sbin/php-fpm \
+  --version 8.4.25
+```
+
+The generator extracts `zif_system`, `zval_ptr_dtor`, and `basic_globals` with
+`nm` and copies the remaining geometry from `profiles/8.4.26-fpm.json`. The
+result is always `verified: false` / `rce: false`: calibrate it with `leak`,
+`primitive`, and `endgame` before trusting it. PHP 8.5.11 was evaluated but its
 allocator layout did not reproduce the HTTP leak with this geometry, so it is
 not shipped as a supported profile. The schema documents the expected shape.
 
