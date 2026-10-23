@@ -100,7 +100,7 @@ needs its own offsets; `calibrate` derives them over HTTP (see
 
 PHP 7.x never received a fix, so every 7.x release is vulnerable **to the
 upstream bug**, but this particular chain does not apply below PHP 8.0. The
-reason is in the source, not in the offsets:
+reason is in the source, and it was verified against a live 7.4.33 lab:
 
 - **PHP >= 8.0** wraps the session decode in `zend_try/zend_catch` and calls
   `php_session_cancel_decode()` -> `php_session_destroy()` on a bailout
@@ -110,9 +110,22 @@ reason is in the source, not in the offsets:
   use-after-free this repository exploits.
 - **PHP <= 7.x** has no `php_session_cancel_decode()` at all. The bailout
   skips `PHP_VAR_UNSERIALIZE_DESTROY` and nothing frees the struct, so
-  `BG(unserialize).data` keeps pointing at *live* memory. There is nothing
-  to reclaim, and `reclaim-probe`/`primitive` never observe a forged value:
-  the stale pointer is dangling in name only.
+  `BG(unserialize).data` keeps pointing at *live* memory: `level=1` and a
+  valid `data` pointer are still set after the producer OOM (measured at
+  `BG+0xdc0/0xdc8` on 7.4.33), but there is no hole to fill.
+
+Without a freed struct there is no write primitive: the `var_entries` block
+and the zval `R:2` resolves to are both live, and forging them is what
+makes `pDestructor = zif_system` possible. The one thing that *is* freed on
+7.x is the session string itself (a read-only UAF), and it cannot be
+reclaimed either — the slot at `chunk+0x89800` was measured intact after
+upload buffers of every matching Zend-MM class (2016/2000/1992/4071/4000/8000
+bytes) and after ~600 shape/header combinations.
+
+The PHP 5.4-7.x exposure described by the advisory comes from the *other*
+flaw (CVE-2026-109619's upload-progress logic: POST-body session-ID fixation
+plus unvalidated upload filenames), which this repository does not
+implement.
 
 `php2shell_fpm_versions.has_session_cancel_decode()` detects this from the
 source tree or a release tarball, and `php2shell_fpm_matrix.py` classifies
