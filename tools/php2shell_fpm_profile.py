@@ -35,13 +35,19 @@ RUNTIME = os.path.join(ROOT, "lab", "fpm", "runtime")
 SYMBOLS = ("zif_system", "zval_ptr_dtor", "basic_globals")
 OFFSETS_C = os.path.join(HERE, "php2shell_fpm_offsets.c")
 
-# branch -> first release that carries the fix
+# branch -> first release that carries the fix.  PHP 8.1 and older (7.x
+# included) are end-of-life: upstream never patched them, so every release
+# of those branches is vulnerable and the profile records UNPATCHED.
 FIXED_IN = {
+    "7.2": None,
+    "7.4": None,
     "8.2": "8.2.35",
     "8.3": "8.3.36",
     "8.4": "8.4.27",
     "8.5": "8.5.12",
 }
+
+UNPATCHED = "none (EOL branch, no upstream fix)"
 
 # fallback layout (PHP 8.4) used when a build has no headers or source
 DEFAULT_LAYOUT = {
@@ -226,7 +232,7 @@ def build_draft(version: str, symbols: dict[str, int], template: dict,
         "name": f"php-{version}-fpm",
         "php_version": version,
         "branch": branch,
-        "fixed_in": fixed_in or FIXED_IN.get(branch, "unknown"),
+        "fixed_in": fixed_in or FIXED_IN.get(branch, "unknown") or UNPATCHED,
         "verified": False,
         "rce": False,
         "distro": distro,

@@ -59,8 +59,11 @@ GROUP_NAME = subprocess.run(
 ).stdout.strip() or USER_NAME
 
 # The affected version matrix (CVE-2026-109619): every release of the
-# supported branches up to (but excluding) the fixed one.
+# patched branches up to (but excluding) the fixed one, plus the newest
+# release of the end-of-life branches upstream never fixed (7.2, 7.4).
 BRANCHES: tuple[tuple[str, int], ...] = (
+    ("7.2", 34),
+    ("7.4", 33),
     ("8.2", 34),
     ("8.3", 35),
     ("8.4", 26),
