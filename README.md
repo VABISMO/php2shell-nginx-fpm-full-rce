@@ -74,7 +74,7 @@ memsets `BG(unserialize)`:
 | 8.4 | 8.4.0 – 8.4.26 | 8.4.27 | **verified profiles (8.4.25, 8.4.26)** |
 | 8.3 | 8.3.0 – 8.3.35 | 8.3.36 | lab build + remote calibration |
 | 8.2 | 8.2.0 – 8.2.34 | 8.2.35 | lab build + remote calibration |
-| 8.1 and older (7.x, 5.x) | every release | **never patched** | lab build + remote calibration |
+| 8.1 and older (7.x, 5.x) | every release | **never patched** | upstream bug present, but **this chain needs 8.0+** (see below) |
 
 `tools/php2shell_fpm_versions.py` is the single source of truth for that
 matrix: `is_vulnerable()`, `fixed_in()`, `affected_versions()`, and
@@ -96,21 +96,42 @@ The verified profiles are Debian-style, user-prefix PHP builds compiled by
 needs its own offsets; `calibrate` derives them over HTTP (see
 [Remote calibration](#remote-calibration-of-any-version)).
 
-### Legacy branches (PHP 7.x)
+### Legacy branches (PHP 7.x) and why this chain stops at 8.0
 
-PHP 7.x never received a fix, so every 7.x release is vulnerable. Two
-build- and layout-level differences are handled for you:
+PHP 7.x never received a fix, so every 7.x release is vulnerable **to the
+upstream bug**, but this particular chain does not apply below PHP 8.0. The
+reason is in the source, not in the offsets:
+
+- **PHP >= 8.0** wraps the session decode in `zend_try/zend_catch` and calls
+  `php_session_cancel_decode()` -> `php_session_destroy()` on a bailout
+  (`ext/session/session.c`). That frees the `php_unserialize_data` struct
+  the OOM left behind, and the *freed* slot is what a later request
+  reclaims. `BG(unserialize).data` keeps pointing at it: that is the
+  use-after-free this repository exploits.
+- **PHP <= 7.x** has no `php_session_cancel_decode()` at all. The bailout
+  skips `PHP_VAR_UNSERIALIZE_DESTROY` and nothing frees the struct, so
+  `BG(unserialize).data` keeps pointing at *live* memory. There is nothing
+  to reclaim, and `reclaim-probe`/`primitive` never observe a forged value:
+  the stale pointer is dangling in name only.
+
+`php2shell_fpm_versions.has_session_cancel_decode()` detects this from the
+source tree or a release tarball, and `php2shell_fpm_matrix.py` classifies
+such builds as `chain n/a` instead of reporting them as failures. The
+remaining 7.x-specific support (the legacy five-pointer struct shape, the
+`_zval_ptr_dtor` symbol alias, and the glibc build fixes in
+`lab/fpm/build_php.sh`) is kept so the laboratory can still run 7.2/7.4 for
+comparisons.
+
+Everything else about 7.x is handled for you:
 
 - `lab/fpm/build_php.sh` fixes the two places 7.x mis-detects modern glibc
   (the POSIX three-argument `readdir_r()` and the `fopencookie` seek
   handler), so 7.2/7.4 build with a current toolchain;
-- PHP <= 7.3 keeps `php_unserialize_data` as five pointers with the
-  `var_entries` blocks allocated separately, and PHP <= 7.2 exports
-  `_zval_ptr_dtor` (with an underscore). The profile generator parses both
-  shapes from the source tree and records `"legacy": true`, and the payload
-  builder forges the matching structure: the fake `var_entries` starts at
-  the head of the reclaim buffer, which is also the block PHP 7's
-  `var_destroy()` frees.
+- the profile generator parses both struct shapes from the source tree and
+  records `"legacy": true` for the five-pointer one, and the payload builder
+  forges the matching structure (the fake `var_entries` starts at the head
+  of the reclaim buffer, which is also the block PHP 7's `var_destroy()`
+  frees).
 
 ## How the chain works
 

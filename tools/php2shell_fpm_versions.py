@@ -163,6 +163,44 @@ def source_is_fixed(source: str) -> bool:
     raise UnknownVersion(f"no ext/standard/basic_functions.c in {source}")
 
 
+def has_session_cancel_decode(source: str) -> bool:
+    """True when the build tears the session down on a decode bailout.
+
+    ``php_session_decode`` wraps the serializer in ``zend_try/zend_catch``
+    and calls ``php_session_cancel_decode()`` -> ``php_session_destroy()``,
+    which frees the ``php_unserialize_data`` struct the OOM left behind.
+    That freed slot is the one the chain reclaims.  PHP <= 7.x has no such
+    path: the bailout skips ``PHP_VAR_UNSERIALIZE_DESTROY`` and nothing
+    frees the struct, so ``BG(unserialize).data`` keeps pointing at live
+    memory and there is no use-after-free to exploit.
+    """
+    if os.path.isdir(source):
+        path = os.path.join(source, "ext", "session", "session.c")
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    else:
+        with tarfile.open(source, "r:*") as tar:
+            text = ""
+            for member in tar.getmembers():
+                if member.name.endswith("ext/session/session.c"):
+                    handle = tar.extractfile(member)
+                    if handle is not None:
+                        text = handle.read().decode("utf-8", "replace")
+                    break
+    return "php_session_cancel_decode" in text
+
+
+def chain_applies(version: str) -> bool:
+    """Whether this repository's chain can apply to a version at all.
+
+    The version string only tells the supported branches apart (8.0+); a
+    real build is classified with :func:`has_session_cancel_decode`, which
+    reads the source instead of trusting the version.
+    """
+    major, minor, _patch = parse(version)
+    return (major, minor) >= (8, 0)
+
+
 def build_status(binary: str) -> str:
     """Return the version string a php-fpm binary reports."""
     proc = subprocess.run([binary, "-v"], capture_output=True, text=True)

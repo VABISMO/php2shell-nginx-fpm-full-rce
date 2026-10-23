@@ -61,6 +61,12 @@ def verify(version: str) -> tuple[str, str]:
         return "NOT BUILT", ""
     if not registry.is_vulnerable(version):
         return "patched (skipped)", ""
+    source = os.path.join(ROOT, "lab", "fpm", "runtime", "src",
+                          f"php-{version}")
+    if os.path.isdir(source) and not registry.has_session_cancel_decode(source):
+        return ("chain n/a (no cancel_decode)", "PHP <= 7.x never frees the "
+                                                "unserialize struct on the "
+                                                "bailout")
 
     proof = f"matrix-{version.replace('.', '')}"
     local = os.path.join(OUTDIR, proof)

