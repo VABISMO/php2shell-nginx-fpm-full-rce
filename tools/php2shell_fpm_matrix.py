@@ -115,9 +115,8 @@ def main() -> int:
     for version, status, text in results:
         print(f"  {version:9} {status:18} {text}")
     report = os.path.join("/tmp", "php2shell-matrix.json")
-    with contextlib.suppress(OSError):
-        with open(report, "w", encoding="utf-8") as handle:
-            json.dump(results, handle, indent=1)
+    with contextlib.suppress(OSError), open(report, "w", encoding="utf-8") as handle:
+        json.dump(results, handle, indent=1)
     return 0
 
 

