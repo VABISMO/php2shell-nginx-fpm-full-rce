@@ -136,7 +136,55 @@
       "additionalProperties": false
     },
     "status": {"type": "string"},
-    "oom_mb": {"type": "integer", "minimum": 1}
+    "oom_mb": {"type": "integer", "minimum": 1},
+    "layout": {
+      "type": "object",
+      "description": "struct layouts of the build, derived from its headers",
+      "required": ["unserialize_data", "var_entries", "zval", "zend_array"],
+      "properties": {
+        "unserialize_data": {
+          "type": "object",
+          "required": ["last", "entries", "size"],
+          "properties": {
+            "last": {"type": "integer", "minimum": 0},
+            "first_dtor": {"type": "integer", "minimum": 0},
+            "last_dtor": {"type": "integer", "minimum": 0},
+            "allowed_classes": {"type": "integer", "minimum": 0},
+            "ref_props": {"type": "integer", "minimum": 0},
+            "cur_depth": {"type": "integer", "minimum": 0},
+            "max_depth": {"type": "integer", "minimum": 0},
+            "entries": {"type": "integer", "minimum": 0},
+            "size": {"type": "integer", "minimum": 1}
+          },
+          "additionalProperties": false
+        },
+        "var_entries": {
+          "type": "object",
+          "properties": {
+            "used_slots": {"type": "integer", "minimum": 0},
+            "next": {"type": "integer", "minimum": 0},
+            "data": {"type": "integer", "minimum": 0},
+            "max": {"type": "integer", "minimum": 1}
+          },
+          "additionalProperties": false
+        },
+        "bg": {
+          "type": "object",
+          "properties": {
+            "unserialize_data": {"type": "integer", "minimum": 0},
+            "unserialize_level": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "zval": {"type": "object"},
+        "zend_array": {"type": "object"},
+        "zend_reference": {"type": "object"},
+        "zend_string": {"type": "object"},
+        "zend_execute_data": {"type": "object"},
+        "bucket": {"type": "object"}
+      },
+      "additionalProperties": false
+    }
   },
   "additionalProperties": false
 }

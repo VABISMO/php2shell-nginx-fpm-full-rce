@@ -2,10 +2,16 @@
 """
 php2shell_fpm_labs.py — local nginx + PHP-FPM laboratory (no root, no docker).
 
-Two user-prefix builds share one nginx:
+Every user-prefix build under lab/fpm/runtime/php-<version>/ gets two HTTP
+endpoints (chain + builder) and two FastCGI listeners.  The documented
+builds keep their published ports:
+
     8.4.25  chain http :8130 -> fpm :9021   builder http :8131 -> fpm :9022
     8.4.26  chain http :8110 -> fpm :9001   builder http :8111 -> fpm :9002
     8.4.27  chain http :8120 -> fpm :9011   builder http :8121 -> fpm :9012
+
+Any other build is assigned ports automatically (from :8140 / :9031 up) so
+the whole affected version matrix can be calibrated in one lab.
 
 Pools (php-fpm.conf.in):
     chain   memory_limit=8M,  cleanup=On,  save_path=<runtime>/session
@@ -14,6 +20,7 @@ Pools (php-fpm.conf.in):
 Commands:
     python3 tools/php2shell_fpm_labs.py up [--only 8.4.26]
     python3 tools/php2shell_fpm_labs.py status
+    python3 tools/php2shell_fpm_labs.py ports
     python3 tools/php2shell_fpm_labs.py smoke
     python3 tools/php2shell_fpm_labs.py test
     python3 tools/php2shell_fpm_labs.py down
@@ -51,12 +58,85 @@ GROUP_NAME = subprocess.run(
     ["id", "-gn"], capture_output=True, text=True
 ).stdout.strip() or USER_NAME
 
+# The affected version matrix (CVE-2026-109619): every release of the
+# supported branches up to (but excluding) the fixed one.
+BRANCHES: tuple[tuple[str, int], ...] = (
+    ("8.2", 34),
+    ("8.3", 35),
+    ("8.4", 26),
+    ("8.5", 11),
+)
+
 # version -> (chain_http, builder_http, chain_fpm, builder_fpm)
-BUILDS: dict[str, tuple[int, int, int, int]] = {
+# The documented builds keep their published ports; every other build gets
+# ports assigned automatically so a whole version matrix fits in one lab.
+PINNED_PORTS: dict[str, tuple[int, int, int, int]] = {
     "8.4.25": (8130, 8131, 9021, 9022),
     "8.4.26": (8110, 8111, 9001, 9002),
     "8.4.27": (8120, 8121, 9011, 9012),
+    "8.2.35": (8140, 8141, 9031, 9032),
+    "8.3.36": (8150, 8151, 9041, 9042),
+    "8.5.12": (8160, 8161, 9051, 9052),
 }
+AUTO_HTTP_BASE = 8200
+AUTO_FPM_BASE = 9100
+
+
+def canonical_versions() -> list[str]:
+    """Every affected release, in a stable order (drives the port map)."""
+    versions = []
+    for branch, last in BRANCHES:
+        for patch in range(0, last + 1):
+            versions.append(f"{branch}.{patch}")
+    return versions
+
+
+def version_key(version: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(part) for part in version.split("."))
+    except ValueError:
+        return (0,)
+
+
+def built_versions() -> list[str]:
+    """Versions with a php-fpm binary in the lab runtime."""
+    if not os.path.isdir(RUNTIME):
+        return []
+    versions = []
+    for name in os.listdir(RUNTIME):
+        if not name.startswith("php-"):
+            continue
+        version = name[4:]
+        if os.path.isfile(os.path.join(RUNTIME, name, "sbin", "php-fpm")):
+            versions.append(version)
+    return sorted(versions, key=version_key)
+
+
+def builds_map(versions: list[str] | None = None) -> dict[str, tuple[int, int, int, int]]:
+    """Port assignment for the given versions (all built ones by default).
+
+    The ports only depend on the version, not on which other builds happen
+    to be present, so a lab started with a different subset still uses the
+    documented endpoints.
+    """
+    versions = versions if versions is not None else built_versions()
+    slots = {version: index for index, version in enumerate(canonical_versions())}
+    result: dict[str, tuple[int, int, int, int]] = {}
+    for version in versions:
+        if version in PINNED_PORTS:
+            result[version] = PINNED_PORTS[version]
+            continue
+        index = slots.get(version)
+        if index is None:
+            # unknown version: park it after the canonical matrix
+            index = len(slots) + len(result)
+        chain_http = AUTO_HTTP_BASE + 2 * index
+        result[version] = (chain_http, chain_http + 1,
+                           AUTO_FPM_BASE + 2 * index, AUTO_FPM_BASE + 2 * index + 1)
+    return result
+
+
+BUILDS = builds_map()
 
 
 def fpm_prefix(version: str) -> str:
@@ -192,8 +272,22 @@ def wait_http(url: str, timeout: float = 20.0) -> bool:
     return False
 
 
+def select(only: set[str] | None) -> list[str]:
+    """Versions to act on: the --only filter, or every built one."""
+    builds = builds_map()
+    versions = [v for v in builds if only is None or v in only]
+    if only:
+        for version in sorted(only - set(builds)):
+            print(f"[!] {version}: not built; run lab/fpm/build_php.sh {version}")
+    return versions
+
+
 def up(only: set[str] | None) -> None:
-    versions = [v for v in BUILDS if only is None or v in only]
+    builds = builds_map()
+    versions = select(only)
+    if not versions:
+        print("[!] nothing to start")
+        return
     for version in versions:
         if not os.path.isfile(fpm_bin(version)):
             print(f"[!] {version}: missing {fpm_bin(version)}; run lab/fpm/build_php.sh {version}")
@@ -201,7 +295,7 @@ def up(only: set[str] | None) -> None:
         if not os.path.isfile(NGINX_BIN):
             print(f"[!] missing {NGINX_BIN}; run lab/fpm/build_nginx.sh")
             return
-    for version in BUILDS:
+    for version in builds:
         ensure_dirs(version)
     for version in versions:
         write_fpm_conf(version)
@@ -211,7 +305,7 @@ def up(only: set[str] | None) -> None:
 
     busy = []
     for version in versions:
-        for port in BUILDS[version]:
+        for port in builds[version]:
             if not port_free(port):
                 busy.append(port)
     if busy:
@@ -253,7 +347,7 @@ def up(only: set[str] | None) -> None:
             return
         pidfile = os.path.join(fpm_prefix(version), "logs", "fpm.pid")
         master = read_pid(pidfile)
-        chain_http, builder_http, _c, _b = BUILDS[version]
+        chain_http, builder_http, _c, _b = builds[version]
         ok_chain = wait_http(f"http://127.0.0.1:{chain_http}/index.php")
         ok_builder = wait_http(f"http://127.0.0.1:{builder_http}/index.php")
         workers = worker_pids(version, "chain") + worker_pids(version, "builder")
@@ -269,28 +363,30 @@ def up(only: set[str] | None) -> None:
         print(result.stderr)
         print("[!] nginx failed to start")
         return
-    nginx_pid = read_pid(os.path.join(NGINX_PREFIX, "logs", "nginx.pid"))
+    nginx_pid = read_pid(os.path.join(RUNTIME, "logs", "nginx.pid"))
     print(f"    nginx pid={nginx_pid}")
     for version in versions:
-        chain_http, builder_http, _c, _b = BUILDS[version]
+        chain_http, builder_http, _c, _b = builds[version]
         ok = wait_http(f"http://127.0.0.1:{chain_http}/index.php")
         print(f"    {version} front chain:{chain_http}={'ok' if ok else 'FAIL'} "
               f"builder:{builder_http}")
     print("[+] lab up")
 
 
-def down() -> None:
-    nginx_pid = read_pid(os.path.join(NGINX_PREFIX, "logs", "nginx.pid"))
+def down(only: set[str] | None = None) -> None:
+    # nginx fronts every build, so it always goes down; --only restricts the
+    # php-fpm masters that are stopped.
+    nginx_pid = read_pid(os.path.join(RUNTIME, "logs", "nginx.pid"))
     if nginx_pid:
         subprocess.run([NGINX_BIN, "-p", NGINX_PREFIX, "-c", NGINX_CONF, "-s", "quit"],
                        capture_output=True)
         for _ in range(20):
-            if read_pid(os.path.join(NGINX_PREFIX, "logs", "nginx.pid")) is None:
+            if read_pid(os.path.join(RUNTIME, "logs", "nginx.pid")) is None:
                 break
             time.sleep(0.2)
         else:
             os.kill(nginx_pid, signal.SIGKILL)
-    for version in BUILDS:
+    for version in select(only):
         pidfile = os.path.join(fpm_prefix(version), "logs", "fpm.pid")
         master = read_pid(pidfile)
         if master:
@@ -307,10 +403,12 @@ def down() -> None:
     print("[+] lab down")
 
 
-def status() -> None:
-    nginx_pid = read_pid(os.path.join(NGINX_PREFIX, "logs", "nginx.pid"))
+def status(only: set[str] | None = None) -> None:
+    nginx_pid = read_pid(os.path.join(RUNTIME, "logs", "nginx.pid"))
     print(f"nginx  pid={nginx_pid}")
-    for version, (chain_http, builder_http, _c, _b) in BUILDS.items():
+    builds = builds_map()
+    for version in select(only):
+        chain_http, builder_http, _c, _b = builds[version]
         pidfile = os.path.join(fpm_prefix(version), "logs", "fpm.pid")
         master = read_pid(pidfile)
         chain = worker_pids(version, "chain")
@@ -319,9 +417,11 @@ def status() -> None:
               f"http chain=:{chain_http} builder=:{builder_http}")
 
 
-def smoke() -> None:
+def smoke(only: set[str] | None = None) -> None:
     ok = True
-    for version, (chain_http, builder_http, _c, _b) in BUILDS.items():
+    builds = builds_map()
+    for version in select(only):
+        chain_http, builder_http, _c, _b = builds[version]
         for label, port in (("chain", chain_http), ("builder", builder_http)):
             url = f"http://127.0.0.1:{port}/index.php"
             try:
@@ -346,10 +446,11 @@ def smoke() -> None:
     return 0 if ok else 1
 
 
-def test() -> None:
+def test(only: set[str] | None = None) -> None:
     results = []
-    for version in BUILDS:
-        chain_http, _b, _c, _f = BUILDS[version]
+    builds = builds_map()
+    for version in select(only):
+        chain_http, _b, _c, _f = builds[version]
         proof = os.path.join(OUTDIR, "p1")
         with contextlib.suppress(OSError):
             os.unlink(proof)
@@ -357,7 +458,7 @@ def test() -> None:
             sys.executable, os.path.join(HERE, "php2shell_fpm.py"),
             "chain",
             "--base", f"http://127.0.0.1:{chain_http}",
-            "--builder", f"http://127.0.0.1:{BUILDS[version][1]}",
+            "--builder", f"http://127.0.0.1:{builds[version][1]}",
             "--version", version,
             "--command", "id>out/p1",
             "--proof-file", proof,
@@ -375,9 +476,19 @@ def test() -> None:
         print(f"  {version:8} {text:24} {proof}")
 
 
+def ports(only: set[str] | None = None) -> None:
+    """Print the port map of the lab."""
+    builds = builds_map()
+    for version in select(only):
+        chain_http, builder_http, chain_fpm, builder_fpm = builds[version]
+        print(f"{version:9} chain http :{chain_http} fpm :{chain_fpm}   "
+              f"builder http :{builder_http} fpm :{builder_fpm}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Local nginx+FPM PHP2Shell laboratory.")
-    parser.add_argument("command", choices=("up", "down", "status", "smoke", "test"))
+    parser.add_argument("command",
+                        choices=("up", "down", "status", "smoke", "test", "ports"))
     parser.add_argument("--only", default=None, help="comma-separated versions")
     args = parser.parse_args()
     only = set(args.only.split(",")) if args.only else None
@@ -385,14 +496,17 @@ def main() -> int:
         up(only)
         return 0
     if args.command == "down":
-        down()
+        down(only)
         return 0
     if args.command == "status":
-        status()
+        status(only)
+        return 0
+    if args.command == "ports":
+        ports(only)
         return 0
     if args.command == "smoke":
-        return smoke()
-    test()
+        return smoke(only)
+    test(only)
     return 0
 
 
