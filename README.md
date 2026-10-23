@@ -441,9 +441,9 @@ GitHub Actions is configured in `.github/workflows/`:
   - compiles Python and checks shell syntax;
   - runs the unit suite with schema validation.
 - **`live-fpm.yml`** — manual `workflow_dispatch`:
-  - installs build dependencies;
-  - builds nginx and PHP 8.4.26 from source (8.4.25 profile is unit-validated);
-  - starts the local lab;
+  - matrix over PHP 8.4.25 and 8.4.26;
+  - installs build dependencies and builds nginx/PHP from source;
+  - starts the matching local lab;
   - enables `ptrace_scope=0` for the oracle test;
   - runs the full live suite and tears the lab down.
 - **`release.yml`** — on `v*` tags:

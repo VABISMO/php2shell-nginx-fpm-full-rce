@@ -8,9 +8,13 @@ permissions:
 
 jobs:
   live:
-    name: Build and exploit PHP 8.4.26
+    name: Build and exploit PHP ${{ matrix.version }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["8.4.25", "8.4.26"]
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -28,11 +32,11 @@ jobs:
       - name: Build nginx
         run: lab/fpm/build_nginx.sh
 
-      - name: Build PHP 8.4.26
-        run: lab/fpm/build_php.sh 8.4.26
+      - name: Build PHP ${{ matrix.version }}
+        run: lab/fpm/build_php.sh ${{ matrix.version }}
 
       - name: Start lab
-        run: python3 tools/php2shell_fpm_labs.py up --only 8.4.26
+        run: python3 tools/php2shell_fpm_labs.py up --only ${{ matrix.version }}
 
       - name: Enable ptrace for the oracle test
         run: sudo sysctl -w kernel.yama.ptrace_scope=0
@@ -40,6 +44,7 @@ jobs:
       - name: Run live tests
         env:
           PHP2SHELL_FPM_LAB: "1"
+          PHP2SHELL_FPM_VERSION: ${{ matrix.version }}
         run: python3 -m unittest tests.test_fpm.FpmLabIntegrationTests -v
 
       - name: Stop lab

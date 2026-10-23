@@ -265,21 +265,25 @@ class ProfileConsistencyTests(unittest.TestCase):
 
 
 LAB = os.environ.get("PHP2SHELL_FPM_LAB") == "1"
+LAB_VERSION = os.environ.get("PHP2SHELL_FPM_VERSION", "8.4.26")
+LAB_PORTS = {"8.4.25": (8130, 8131), "8.4.26": (8110, 8111)}
 
 
 @unittest.skipUnless(LAB, "set PHP2SHELL_FPM_LAB=1 with the FPM lab up")
 class FpmLabIntegrationTests(unittest.TestCase):
-    """End-to-end primitive and RCE against the local 8.4.26 lab."""
+    """End-to-end primitive and RCE against a local FPM lab."""
 
     def _args(self, **extra):
+        chain, builder = LAB_PORTS[LAB_VERSION]
+        proof = f"out/p1lab-{LAB_VERSION.replace('.', '')}"
         base = dict(
-            base="http://127.0.0.1:8110",
-            builder="http://127.0.0.1:8111",
-            version="8.4.26",
+            base=f"http://127.0.0.1:{chain}",
+            builder=f"http://127.0.0.1:{builder}",
+            version=LAB_VERSION,
             size=4 << 20,
             value=1337337,
-            command="id>out/p1lab",
-            proof_file="out/p1lab",
+            command=f"id>{proof}",
+            proof_file=proof,
         )
         base.update(extra)
         return SimpleNamespace(**base)
