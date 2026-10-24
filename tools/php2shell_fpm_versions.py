@@ -41,6 +41,7 @@ BRANCHES: dict[str, dict] = {
     "7.4": {"fixed_in": None, "last_release": "7.4.33", "slot": 1},
     # EOL, never patched, and without php_session_cancel_decode: the
     # struct-freeing chain starts at 8.2, so these are plant targets
+    "5.6": {"fixed_in": None, "last_release": "5.6.40", "slot": 8},
     "8.0": {"fixed_in": None, "last_release": "8.0.30", "slot": 6},
     "8.1": {"fixed_in": None, "last_release": "8.1.33", "slot": 7},
     "8.2": {"fixed_in": "8.2.35", "last_release": "8.2.34", "slot": 2},

@@ -32,6 +32,7 @@ import argparse
 import contextlib
 import os
 import pwd
+import re
 import signal
 import socket
 import subprocess
@@ -220,22 +221,46 @@ def write_fpm_conf(version: str) -> str:
         "SAVEDIR": os.path.join(prefix, "session"),
         "VER": version,
     })
-    # Directives the build's FPM does not know would fail the config test:
-    # decorate_workers_output only exists from PHP 7.3 on.  A suffixed
-    # version (7.2.34-asan) is treated as its numeric part.
-    try:
-        numeric = tuple(int(part) for part in version.split("."))
-    except ValueError:
-        numeric = tuple(int(part) if part.isdigit() else 99
-                        for part in version.split("."))
-    if numeric < (7, 3, 0):
-        rendered = "\n".join(
-            line for line in rendered.splitlines()
-            if not line.startswith("decorate_workers_output")) + "\n"
     path = os.path.join(prefix, "php-fpm.conf")
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(rendered)
+    drop_unknown_directives(version, path)
     return path
+
+
+def drop_unknown_directives(version: str, path: str,
+                            budget: int = 16) -> None:
+    """Remove directives this build's FPM does not know, using FPM itself.
+
+    ``php-fpm -t`` reports ``unknown entry 'x'`` for anything the binary was
+    not compiled with (``decorate_workers_output`` needs 7.3, for example), so
+    the rendered file is tested and the offending lines are removed until the
+    config is accepted.  Every version then gets exactly the directives it
+    understands, without a per-version table to maintain.
+    """
+    binary = fpm_bin(version)
+    if not os.path.isfile(binary):
+        return
+    prefix = fpm_prefix(version)
+    for _ in range(budget):
+        result = subprocess.run(
+            [binary, "-t", "-y", path, "-c", PHP_INI, "-p", prefix],
+            capture_output=True, text=True)
+        if result.returncode == 0:
+            return
+        unknown = re.search(r"unknown entry '([^']+)'",
+                            (result.stderr or "") + (result.stdout or ""))
+        if not unknown:
+            return  # a different problem: the caller's config test reports it
+        directive = unknown.group(1)
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+        kept = [line for line in lines
+                if not line.strip().startswith(directive)]
+        if len(kept) == len(lines):
+            return  # nothing matched: avoid looping forever
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(kept) + "\n")
 
 
 def write_nginx_conf(versions: list[str]) -> None:
