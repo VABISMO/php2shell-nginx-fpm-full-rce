@@ -85,7 +85,7 @@ if [ ! -f Makefile ] || [ ! -f config.status ]; then
         --without-pear \
         --disable-cgi \
         --disable-phpdbg \
-        CFLAGS="-O2 -g"
+        CFLAGS="${CFLAGS:--O2 -g}"
 fi
 fix_legacy_config
 echo "[*] building php-$VER (-j$JOBS)"

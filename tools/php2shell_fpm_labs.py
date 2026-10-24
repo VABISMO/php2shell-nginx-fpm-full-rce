@@ -221,11 +221,22 @@ def write_fpm_conf(version: str) -> str:
         "VER": version,
     })
     # Directives the build's FPM does not know would fail the config test:
-    # decorate_workers_output only exists from PHP 7.3 on.
-    if tuple(int(part) for part in version.split(".")) < (7, 3, 0):
+    # decorate_workers_output only exists from PHP 7.3 on.  A suffixed
+    # version (7.2.34-asan) is treated as its numeric part.
+    try:
+        numeric = tuple(int(part) for part in version.split("."))
+    except ValueError:
+        numeric = tuple(int(part) if part.isdigit() else 99
+                        for part in version.split("."))
+    if numeric < (7, 3, 0):
         rendered = "\n".join(
             line for line in rendered.splitlines()
             if not line.startswith("decorate_workers_output")) + "\n"
+    # An instrumented build reports its findings on the worker stderr, which
+    # FPM only forwards to the error log when the workers are decorated.
+    if "asan" in version:
+        rendered = rendered.replace("catch_workers_output = no",
+                                    "catch_workers_output = yes")
     path = os.path.join(prefix, "php-fpm.conf")
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(rendered)

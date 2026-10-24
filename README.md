@@ -505,10 +505,24 @@ Verified output on 7.4.33:
 ```
 
 This is arbitrary **session-file write** pre-auth, not RCE by itself: core
-PHP serializes the filename with correct lengths, so turning the plant into
+PHP serializes the filename with correct lengths, the `php` serializer
+rejects keys containing `|` (so the key cannot smuggle objects), and the
+files handler validates the session id (`php_session_valid_key`, only
+`[a-zA-Z0-9,-]`), which rules out path traversal. Turning the plant into
 code execution needs an application gadget or a local file include in the
-target. The `no-oracle` chain above is the one that reaches code execution
-with no application help, and it needs PHP >= 8.0.
+target.
+
+The remaining core-only route would be a memory-corruption primitive inside
+the upload-progress cycle itself. A PHP 7.2.34 build with
+`-fsanitize=address` (see `lab/fpm/build_php.sh 7.2.34-asan`, which honours
+`CFLAGS`) was driven through the documented sequences — progress uploads
+with and without a file part, multi-update bodies, alternating session ids —
+and AddressSanitizer reported **no** use-after-free or overflow. Together
+with the missing `php_session_cancel_decode()`, that is why this repository
+reports PHP <= 7.x as *session plant* and not as RCE.
+
+The `no-oracle` chain above is the one that reaches code execution with no
+application help, and it needs PHP >= 8.0.
 
 ## HTTP-only base leak
 
