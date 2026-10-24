@@ -203,7 +203,8 @@ short-session string into an OOB read primitive for ASLR bases.
 │   ├── php2shell_fpm_profile.py draft profile generator
 │   ├── php2shell_fpm_versions.py affected-version registry
 │   ├── php2shell_fpm_offsets.c  struct offsets compiled per build
-│   └── php2shell_fpm_labs.py  user-prefix nginx/FPM launcher
+│   ├── php2shell_fpm_labs.py  user-prefix nginx/FPM launcher
+│   └── readme_table.py        regenerate the README profile table
 ├── Makefile
 ├── requirements-dev.txt
 └── pyproject.toml
@@ -387,24 +388,23 @@ All ports bind to `127.0.0.1`. The proof directory
 
 ## Profile and offsets
 
-Every shipped profile is `verified: true` / `rce: true` and was produced by
-the automatic `calibrate` run against a live build:
+<!-- profile-table:start -->
+Every shipped profile is `verified: true` / `rce: true` and was produced by the automatic `calibrate` run against a live build:
 
-| Field | 8.2.34 | 8.3.35 | 8.4.0 | 8.4.25 | 8.4.26 |
-| --- | --- | --- | --- | --- | --- |
-| `zif_system` | `0x3769d0` | `0x37d5f0` | `0x384380` | `0x386460` | `0x386660` |
-| `zval_ptr_dtor` | `0x439120` | `0x446460` | `0x542dd0` | `0x549890` | `0x54a0d0` |
-| `basic_globals` | `0xa15220` | `0xa14e80` | `0xa04580` | `0xa04660` | `0xa04660` |
-| BG data / level offset | `848` / `856` | `856` / `864` | `872` / `880` | `872` / `880` | `872` / `880` |
-| `reclaim_size` | `16384` | `16384` | `12288` | `12288` | `12288` |
-| `no_oracle` candidate | `0x80000`+`0xfe8` | `0x80000`+`0xfe8` | `0x7f000`+`0xfe8` | `0x7f000`+`0xfe8` | `0x7f000`+`0xfe8` |
-| chunk base offset | `0x8c000` | `0x8c000` | `0x8b000` | `0x8b000` | `0x8b000` |
-| PIE base offset | `0x4a2c85` | `0x4b24f6` | `0x4ea787` | `0x4e9fc7` | `0x4ea787` |
+| Field | 8.2.34 | 8.3.35 | 8.4.0 | 8.4.1 | 8.4.25 | 8.4.26 |
+| --- | --- | --- | --- | --- | --- | --- |
+| zif_system | `0x3769d0` | `0x37d5f0` | `0x384380` | `0x384380` | `0x386460` | `0x386660` |
+| zval_ptr_dtor | `0x439120` | `0x446460` | `0x542dd0` | `0x542e50` | `0x549890` | `0x54a0d0` |
+| basic_globals | `0xa15220` | `0xa14e80` | `0xa04580` | `0xa04580` | `0xa04660` | `0xa04660` |
+| BG data / level offset | `848` / `856` | `856` / `864` | `872` / `880` | `872` / `880` | `872` / `880` | `872` / `880` |
+| `reclaim_size` | `16384` | `16384` | `16384` | `16384` | `12288` | `12288` |
+| `no_oracle` candidate | `0x80000`+`0xfe8` | `0x80000`+`0xfe8` | `0x7f000`+`0xfe8` | `0x7f000`+`0xfe8` | `0x7f000`+`0xfe8` | `0x7f000`+`0xfe8` |
+| chunk base offset | `0x8c000` | `0x8c000` | `0x8b000` | `0x8b000` | `0x8b000` | `0x8b000` |
+| PIE base offset | `0x4a2c85` | `0x4b24f6` | `0x4e4467` | `0x4e44e7` | `0x4e9fc7` | `0x4ea787` |
 
-Identical on every build: `struct_size` `8216`, `reclaim_pads` `[4096, 4096]`,
-leak arm `/bigvar.php`, leak pads `[32768, 16384]`, forged header `0x17e8`,
-read length `0x15810`, chunk pointer offset `0x77f8`, PIE pointer offset
-`0x157e8`.
+Identical on every build: struct_size `8216`, reclaim_pads `[4096, 4096]`, leak arm `/bigvar.php`, leak pads `[32768, 16384]`, forged header `0x17e8`, read length `0x15810`, chunk pointer offset `0x77f8`, PIE pointer offset `0x157e8`.
+
+<!-- profile-table:end -->
 
 Validate the profile:
 
@@ -569,7 +569,13 @@ make test       # unit suite
 make lint       # ruff
 make validate   # profile against schema
 make ci         # lint + test + validate
+make matrix     # verify every unpatched build over HTTP
+make readme      # regenerate the README profile table after calibrating
 ```
+
+The profile table in [Profile and offsets](#profile-and-offsets) is generated
+from `profiles/*-fpm.json` by `tools/readme_table.py`; the unit suite fails if
+it drifts from the shipped profiles (`--check` prints the difference).
 
 ### Verifying the whole unpatched matrix
 

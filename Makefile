@@ -1,4 +1,4 @@
-.PHONY: help test lint validate ci build-nginx build-8.4.25 build-8.4.26 build-8.4.27 profile-draft calibrate-remote remote matrix labs-up labs-down labs-status labs-smoke labs-test
+.PHONY: help test lint validate ci build-nginx build-8.4.25 build-8.4.26 build-8.4.27 profile-draft calibrate-remote remote matrix readme labs-up labs-down labs-status labs-smoke labs-test
 
 help:                          ## Show this help
 	@grep -E '^[a-zA-Z0-9_.-]+:.*##' $(MAKEFILE_LIST) | \
@@ -48,6 +48,9 @@ remote:                        ## Run the 100%-remote chain (VERSION=... BASE=..
 
 matrix:                        ## Verify the remote chain on every unpatched build
 	python3 tools/php2shell_fpm_matrix.py
+
+readme:                        ## Regenerate the profile table in README.md
+	python3 tools/readme_table.py
 
 labs-up:                       ## Start the local nginx+FPM labs
 	python3 tools/php2shell_fpm_labs.py up

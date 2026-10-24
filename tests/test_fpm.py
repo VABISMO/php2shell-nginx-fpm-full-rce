@@ -27,6 +27,7 @@ import php2shell_fpm_labs as labs  # noqa: E402
 import php2shell_fpm_matrix as matrix  # noqa: E402
 import php2shell_fpm_profile as profile_gen  # noqa: E402
 import php2shell_fpm_versions as versions  # noqa: E402
+import readme_table  # noqa: E402
 
 D = 0x7F07BE280000      # lab-observed stale struct address
 K = 0xFE8               # lab-observed reclaim content offset
@@ -472,10 +473,9 @@ class DocumentationConsistencyTests(unittest.TestCase):
 
     @staticmethod
     def _profiles() -> dict[str, dict]:
-        out = {}
-        for path in sorted((ROOT / "profiles").glob("*-fpm.json")):
-            out[path.name.split("-")[0]] = json.loads(path.read_text())
-        return out
+        """The profiles as they are *shipped*: what git contains, which is
+        exactly what a CI checkout sees (work in progress stays local)."""
+        return dict(readme_table.load_profiles(committed=True))
 
     def test_every_shipped_profile_is_verified(self):
         profiles = self._profiles()
