@@ -32,8 +32,8 @@ import php2shell_fpm_versions as registry  # noqa: E402
 CLIENT = os.path.join(HERE, "php2shell_fpm.py")
 OUTDIR = os.path.join(labs.WEBROOT, "out")
 
-DEFAULT_MATRIX = ("7.2.34", "7.4.33", "8.2.34", "8.3.35", "8.4.25",
-                  "8.4.26", "8.5.11")
+DEFAULT_MATRIX = ("7.2.34", "7.4.33", "8.2.34", "8.3.35", "8.4.0",
+                  "8.4.25", "8.4.26")
 
 
 def run(cmd: list[str], timeout: int = 3000) -> subprocess.CompletedProcess:

