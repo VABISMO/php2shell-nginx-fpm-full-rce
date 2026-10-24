@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -32,7 +33,11 @@ import php2shell_fpm_versions as registry  # noqa: E402
 CLIENT = os.path.join(HERE, "php2shell_fpm.py")
 OUTDIR = os.path.join(labs.WEBROOT, "out")
 
-DEFAULT_MATRIX = ("7.2.34", "7.4.33", "8.2.34", "8.3.35", "8.4.0",
+# one representative per branch: the plant targets (5.x, 7.x, 8.0/8.1) and
+# the RCE-verified branches (8.2, 8.3, 8.4).  Any other list can be passed
+# explicitly, e.g. every 8.4.x build.
+DEFAULT_MATRIX = ("5.4.45", "5.5.38", "5.6.40", "7.2.34", "7.4.33",
+                  "8.0.30", "8.1.33", "8.2.34", "8.3.35", "8.4.0",
                   "8.4.25", "8.4.26")
 
 
@@ -120,12 +125,20 @@ def verify(version: str) -> tuple[str, str]:
     return ("REMOTE RCE" if ok else "no proof"), text
 
 
+def _version_key(version: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(part) for part in version.split("."))
+    except ValueError:
+        return (99,)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("versions", nargs="*", default=list(DEFAULT_MATRIX),
                         help="versions to verify (default: the unpatched matrix)")
     args = parser.parse_args()
     os.makedirs(OUTDIR, exist_ok=True)
+    verification_path = os.path.join(ROOT, "profiles", "verification.json")
 
     results = []
     for version in args.versions:
@@ -135,8 +148,25 @@ def main() -> int:
     print("\n===== unpatched matrix, 100% HTTP =====")
     for version, status, text in results:
         print(f"  {version:9} {status:18} {text}")
-    report = os.path.join("/tmp", "php2shell-matrix.json")
-    with contextlib.suppress(OSError), open(report, "w", encoding="utf-8") as handle:
+    # The verdicts land in the repository: the README coverage block and the
+    # consistency tests read them, so every published claim comes from an
+    # actual run instead of a hand-written sentence.  Partial runs merge, so
+    # a later matrix does not erase earlier evidence.
+    record: dict[str, dict] = {}
+    if os.path.isfile(verification_path):
+        with open(verification_path, encoding="utf-8") as handle, contextlib.suppress(ValueError):
+            record = json.load(handle)
+    stamp = time.strftime("%Y-%m-%d")
+    for version, status, _text in results:
+        if status in ("REMOTE RCE", "SESSION PLANT"):
+            record[version] = {"result": status, "verified_at": stamp}
+    with open(verification_path, "w", encoding="utf-8") as handle:
+        json.dump(dict(sorted(record.items(),
+                              key=lambda item: _version_key(item[0]))),
+                  handle, indent=1)
+        handle.write("\n")
+    with open(os.path.join("/tmp", "php2shell-matrix.json"),
+              "w", encoding="utf-8") as handle:
         json.dump(results, handle, indent=1)
     return 0
 

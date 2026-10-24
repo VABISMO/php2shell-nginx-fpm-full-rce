@@ -305,6 +305,28 @@ class FpmLabIntegrationTests(unittest.TestCase):
         self.assertEqual(fpm.cmd_no_oracle(self._args()), 0)
 
 
+@unittest.skipUnless(LAB, "set PHP2SHELL_FPM_LAB=1 with the FPM lab up")
+class FpmLabPoisonTests(unittest.TestCase):
+    """The session-file plant against a live build, over HTTP only.
+
+    PHP <= 8.1 targets are verified with this instead of the RCE chain:
+    the struct-freeing chain needs 8.2+, the plant works everywhere with
+    session.upload_progress.
+    """
+
+    def test_session_file_plant(self):
+        chain, builder = LAB_PORTS[LAB_VERSION]
+        sid = ("cilab" + LAB_VERSION.replace(".", ""))[:20]
+        args = SimpleNamespace(
+            base=f"http://127.0.0.1:{chain}",
+            builder=f"http://127.0.0.1:{builder}",
+            version=LAB_VERSION,
+            sid=sid,
+            payload="PLANTED_BY_CI",
+            progress_key=None)
+        self.assertEqual(fpm.cmd_poison(args), 0)
+
+
 class VersionRegistryTests(unittest.TestCase):
     """The advisory matrix (CVE-2026-109619) has to drive every tool."""
 
@@ -489,33 +511,38 @@ class DocumentationConsistencyTests(unittest.TestCase):
 
     def test_readme_offsets_table_matches_profiles(self):
         text = (ROOT / "README.md").read_text()
-        lines = [line for line in text.splitlines()
-                 if line.startswith("| `zif_system` |")
-                 or line.startswith("| Field | 8.2.34")]
-        self.assertTrue(lines, "offsets table header not found in README")
-        header = [cell.strip() for cell in lines[0].strip("|").split("|")]
-        versions = header[1:]
+        header = next((line for line in text.splitlines()
+                       if line.startswith("| Version | zif_system |")),
+                      None)
+        self.assertIsNotNone(header, "profile table header not found in README")
+        columns = [cell.strip() for cell in header.strip("|").split("|")]
+        for column in ("zif_system", "zval_ptr_dtor", "basic_globals"):
+            self.assertIn(column, columns)
+
+        profiles = self._profiles()
         rows = {}
         for line in text.splitlines():
             if not line.startswith("| "):
                 continue
             cells = [cell.strip() for cell in line.strip("|").split("|")]
-            if len(cells) == len(versions) + 1 and cells[0].strip("`") in (
-                    "zif_system", "zval_ptr_dtor", "basic_globals"):
-                rows[cells[0].strip("`")] = cells[1:]
-        self.assertEqual(len(rows), 3, "offsets table rows not found")
+            if len(cells) == len(columns) and cells[0] in profiles:
+                rows[cells[0]] = dict(zip(columns, cells, strict=True))
 
-        profiles = self._profiles()
-        self.assertEqual(sorted(versions), sorted(profiles))
-        for index, version in enumerate(versions):
-            profile = profiles[version]
+        self.assertEqual(sorted(rows), sorted(profiles),
+                         "README table must list exactly the shipped profiles")
+        for version, profile in profiles.items():
+            row = rows[version]
             with self.subTest(version=version):
-                self.assertEqual(rows["zif_system"][index].strip("`"),
+                self.assertEqual(row["zif_system"].strip("`"),
                                  profile["libphp"]["zif_system"])
-                self.assertEqual(rows["zval_ptr_dtor"][index].strip("`"),
+                self.assertEqual(row["zval_ptr_dtor"].strip("`"),
                                  profile["libphp"]["zval_ptr_dtor"])
-                self.assertEqual(rows["basic_globals"][index].strip("`"),
+                self.assertEqual(row["basic_globals"].strip("`"),
                                  profile["fpm"]["basic_globals"])
+                self.assertEqual(
+                    row["BG offs"],
+                    f"{profile['fpm']['bg_unserialize_data_off']}/"
+                    f"{profile['fpm']['bg_unserialize_level_off']}")
 
     def test_matrix_default_targets_are_accounted_for(self):
         """Every version of the default matrix is either RCE-verified or a
@@ -556,6 +583,55 @@ class DocumentationConsistencyTests(unittest.TestCase):
                 continue
             self.assertTrue((ROOT / ref).exists(),
                             f"README references missing {ref}")
+
+
+    def test_readme_coverage_matches_evidence(self):
+        """The coverage block is generated from shipped profiles plus the
+        verdicts the matrix runner persisted; both must agree."""
+        text = (ROOT / "README.md").read_text()
+        block = text.split("<!-- coverage:start -->")[1].split(
+            "<!-- coverage:end -->")[0]
+
+        def row(label: str) -> str:
+            return next(line for line in block.splitlines()
+                        if line.startswith(f"| {label}"))
+
+        def expand(cell: str) -> set[str]:
+            """`8.4.0`-`8.4.26` -> every version inside the range."""
+            # the generator writes ranges as `low`-`high`: glue them first
+            cell = cell.replace("`-`", "-")
+            found: set[str] = set()
+            for token in re.findall(r"`([^`]+)`", cell):
+                if "-" not in token:
+                    found.add(token)
+                    continue
+                low, high = token.split("-", 1)
+                low, high = low.strip("`"), high.strip("`")
+                low_base, low_patch = low.rsplit(".", 1)
+                high_base, high_patch = high.rsplit(".", 1)
+                if low_base != high_base:
+                    found.add(token)
+                    continue
+                for patch in range(int(low_patch), int(high_patch) + 1):
+                    found.add(f"{low_base}.{patch}")
+            return found
+
+        rce = expand(row("RCE over HTTP only"))
+        self.assertEqual(rce, {version for version, profile
+                               in self._profiles().items()
+                               if profile.get("rce")},
+                         "coverage RCE row must list exactly the RCE profiles")
+
+        plant = expand(row("Session-file plant (pre-auth write)"))
+        verification_path = ROOT / "profiles" / "verification.json"
+        self.assertTrue(verification_path.is_file(),
+                        "README documents profiles/verification.json")
+        verdicts = json.loads(verification_path.read_text())
+        expected = {version for version, record in verdicts.items()
+                    if record.get("result") == "SESSION PLANT"}
+        self.assertTrue(expected, "no persisted verification verdicts")
+        self.assertEqual(plant, expected,
+                         "coverage plant row must match verification.json")
 
 
 if __name__ == "__main__":

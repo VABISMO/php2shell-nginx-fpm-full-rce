@@ -8,13 +8,22 @@ permissions:
 
 jobs:
   live:
-    name: Build and exploit PHP ${{ matrix.version }}
+    name: ${{ matrix.suite }} on PHP ${{ matrix.version }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        version: ["8.2.34", "8.3.35", "8.4.0", "8.4.25", "8.4.26"]
+        include:
+          # RCE chain (needs php_session_cancel_decode: PHP >= 8.2)
+          - { version: "8.2.34", suite: FpmLabIntegrationTests }
+          - { version: "8.3.35", suite: FpmLabIntegrationTests }
+          - { version: "8.4.0", suite: FpmLabIntegrationTests }
+          - { version: "8.4.25", suite: FpmLabIntegrationTests }
+          - { version: "8.4.26", suite: FpmLabIntegrationTests }
+          # session-file plant (works on every upload_progress build)
+          - { version: "7.4.33", suite: FpmLabPoisonTests }
+          - { version: "5.6.40", suite: FpmLabPoisonTests }
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -45,7 +54,7 @@ jobs:
         env:
           PHP2SHELL_FPM_LAB: "1"
           PHP2SHELL_FPM_VERSION: ${{ matrix.version }}
-        run: python3 -m unittest tests.test_fpm.FpmLabIntegrationTests -v
+        run: python3 -m unittest tests.test_fpm.${{ matrix.suite }} -v
 
       - name: Stop lab
         if: always()

@@ -73,6 +73,15 @@ fix_legacy_config() {
     fi
 }
 
+# PHP 5.x predates several C rules that GCC 14 enforces as errors
+# (implicit function/int declarations and the old pointer conversions):
+# build them as gnu99 with those diagnostics downgraded again.
+case "$VER" in
+    5.*)
+        CFLAGS="${CFLAGS:--O2 -g} -std=gnu99 -Wno-implicit-function-declaration -Wno-implicit-int -Wno-int-conversion -Wno-incompatible-pointer-types"
+        ;;
+esac
+
 cd "$SRC/php-$VER"
 if [ ! -f Makefile ] || [ ! -f config.status ]; then
     echo "[*] configuring php-$VER (fpm, session, minimal)"

@@ -13,6 +13,7 @@ that).  Run it after adding or calibrating a profile:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import subprocess
@@ -23,27 +24,29 @@ README = os.path.join(ROOT, "README.md")
 PROFILES = os.path.join(ROOT, "profiles")
 START = "<!-- profile-table:start -->"
 END = "<!-- profile-table:end -->"
+COVERAGE_START = "<!-- coverage:start -->"
+COVERAGE_END = "<!-- coverage:end -->"
+VERIFICATION = os.path.join(PROFILES, "verification.json")
 
-# rows that differ between builds; everything else identical goes in the note
-VARIABLE_ROWS = (
+# one row per profile: the fields that differ between builds; everything
+# else identical across the shipped profiles is rendered as prose below
+ROW_FIELDS = (
     ("zif_system", lambda p: f"`{p['libphp']['zif_system']}`"),
     ("zval_ptr_dtor", lambda p: f"`{p['libphp']['zval_ptr_dtor']}`"),
     ("basic_globals", lambda p: f"`{p['fpm']['basic_globals']}`"),
-    ("BG data / level offset",
-     lambda p: f"`{p['fpm']['bg_unserialize_data_off']}` / "
-               f"`{p['fpm']['bg_unserialize_level_off']}`"),
-    ("`reclaim_size`", lambda p: f"`{p['fpm']['reclaim_size']}`"),
-    ("`no_oracle` candidate",
-     lambda p: "`{d_off}`+`{k}`".format(
-         **p["fpm"]["no_oracle"]["candidates"][0])),
-    ("chunk base offset", lambda p: f"`{p['fpm']['leak']['chunk_base_off']}`"),
-    ("PIE base offset", lambda p: f"`{p['fpm']['leak']['pie_base_off']}`"),
+    ("BG offs", lambda p: f"{p['fpm']['bg_unserialize_data_off']}/"
+                          f"{p['fpm']['bg_unserialize_level_off']}"),
+    ("reclaim", lambda p: f"{p['fpm']['reclaim_pads']} x "
+                          f"{p['fpm']['reclaim_size']}"),
+    ("no_oracle", lambda p: "{d_off}+{k}".format(
+        **p["fpm"]["no_oracle"]["candidates"][0])),
+    ("chunk base", lambda p: f"`{p['fpm']['leak']['chunk_base_off']}`"),
+    ("PIE base", lambda p: f"`{p['fpm']['leak']['pie_base_off']}`"),
 )
 
 # fields that must hold for every shipped profile (rendered as prose)
 IDENTICAL_ROWS = (
     ("struct_size", lambda p: f"`{p['fpm']['struct_size']}`"),
-    ("reclaim_pads", lambda p: f"`{p['fpm']['reclaim_pads']}`"),
     ("leak arm", lambda p: f"`{p['fpm']['leak']['arm_path']}`"),
     ("leak pads", lambda p: f"`{p['fpm']['leak']['pads']}`"),
     ("forged header", lambda p: f"`{p['fpm']['leak']['header_content_off']}`"),
@@ -51,6 +54,73 @@ IDENTICAL_ROWS = (
     ("chunk pointer offset", lambda p: f"`{p['fpm']['leak']['chunk_ptr_off']}`"),
     ("PIE pointer offset", lambda p: f"`{p['fpm']['leak']['pie_ptr_off']}`"),
 )
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(part) for part in version.split("."))
+    except ValueError:
+        return (99,)
+
+
+def compress(versions: list[str]) -> str:
+    """8.4.0, 8.4.1, 8.4.2 -> `8.4.0`-`8.4.2` when the run is contiguous."""
+    by_branch: dict[str, list[int]] = {}
+    for version in versions:
+        parts = version.split(".")
+        if len(parts) == 3 and parts[0].isdigit():
+            by_branch.setdefault(f"{parts[0]}.{parts[1]}", []).append(int(parts[2]))
+        else:
+            by_branch.setdefault(version, []).append(0)
+    out = []
+    for branch, patches in sorted(by_branch.items()):
+        patches.sort()
+        start = previous = patches[0]
+        for patch in patches[1:] + [None]:
+            if patch is not None and patch == previous + 1:
+                previous = patch
+                continue
+            if branch.count(".") and patches[0] == previous:
+                out.append(f"`{branch}.{start}`" if start == previous
+                           else f"`{branch}.{start}`-`{branch}.{previous}`")
+            else:
+                out.append(f"`{branch}.{start}`" if start == previous
+                           else f"`{branch}.{start}`-`{branch}.{previous}`")
+            if patch is not None:
+                start = previous = patch
+    return ", ".join(out)
+
+
+def render_coverage(profiles: list[tuple[str, dict]],
+                    verification: dict[str, dict]) -> str:
+    """The coverage table: RCE from the shipped profiles, plant from the
+    verdicts the matrix runner persisted, patched from the registry."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import php2shell_fpm_versions as registry
+
+    rce = [version for version, profile in profiles if profile.get("rce")]
+    plant = [version for version, record in sorted(
+        verification.items(), key=lambda item: _version_key(item[0]))
+        if record.get("result") == "SESSION PLANT"
+        and not any(v == version for v in rce)]
+    # every branch this registry tracks knows the release that fixed it
+    patched = sorted((branch["fixed_in"] for branch in registry.BRANCHES.values()
+                      if branch["fixed_in"]), key=_version_key)
+
+    rows = [
+        ("RCE over HTTP only", compress(rce) or "-"),
+        ("Session-file plant (pre-auth write)", compress(plant) or "-"),
+        ("Patched upstream (cannot RCE)", ", ".join(f"`{v}`" for v in patched)),
+        ("Out of scope",
+         "`5.0`-`5.3` (no `session.upload_progress`), `8.5.x` (not calibrated)"),
+    ]
+    out = ["Coverage generated from `profiles/*-fpm.json`, "
+           "`profiles/verification.json` and the version registry:", "",
+           "| Status | Versions |", "| --- | --- |"]
+    for label, value in rows:
+        out.append(f"| {label} | {value} |")
+    out.append("")
+    return "\n".join(out)
 
 
 def load_profiles(committed: bool = False) -> list[tuple[str, dict]]:
@@ -68,21 +138,23 @@ def load_profiles(committed: bool = False) -> list[tuple[str, dict]]:
     for name in names:
         with open(os.path.join(PROFILES, name), encoding="utf-8") as handle:
             profiles.append((name.split("-")[0], json.load(handle)))
+    # 8.4.2 before 8.4.10, not the lexicographic order of strings
+    profiles.sort(key=lambda item: tuple(int(part) for part in item[0].split(".")))
     return profiles
 
 
 def render(profiles: list[tuple[str, dict]]) -> str:
-    versions = [version for version, _profile in profiles]
+    headers = [label for label, _value in ROW_FIELDS]
     out = [
-        "Every shipped profile is `verified: true` / `rce: true` and was "
-        "produced by the automatic `calibrate` run against a live build:",
+        "Every shipped profile is `verified: true` / `rce: true`, produced by "
+        "the automatic `calibrate` run against a live build:",
         "",
-        "| Field | " + " | ".join(versions) + " |",
-        "| --- | " + " | ".join("---" for _ in versions) + " |",
+        "| Version | " + " | ".join(headers) + " |",
+        "| --- | " + " | ".join("---" for _ in headers) + " |",
     ]
-    for label, value in VARIABLE_ROWS:
-        out.append(f"| {label} | "
-                   + " | ".join(value(profile) for _version, profile in profiles)
+    for version, profile in profiles:
+        out.append(f"| {version} | "
+                   + " | ".join(value(profile) for _label, value in ROW_FIELDS)
                    + " |")
     out.append("")
 
@@ -113,8 +185,20 @@ def main() -> int:
 
     head = text[:text.index(START) + len(START)]
     tail = text[text.index(END):]
-    block = "\n" + render(load_profiles(args.committed)) + "\n"
-    updated = head + block + tail
+    updated = head + "\n" + render(load_profiles(args.committed)) + "\n" + tail
+
+    # the coverage block follows the same rules: generated from the shipped
+    # profiles plus the verdicts the matrix runner persisted
+    if COVERAGE_START in updated and COVERAGE_END in updated:
+        verification: dict[str, dict] = {}
+        if os.path.isfile(VERIFICATION):
+            with open(VERIFICATION, encoding="utf-8") as handle, \
+                    contextlib.suppress(ValueError):
+                verification = json.load(handle)
+        head = updated[:updated.index(COVERAGE_START) + len(COVERAGE_START)]
+        tail = updated[updated.index(COVERAGE_END):]
+        updated = head + "\n" + render_coverage(
+            load_profiles(args.committed), verification) + "\n" + tail
 
     if args.check:
         if updated != text:
