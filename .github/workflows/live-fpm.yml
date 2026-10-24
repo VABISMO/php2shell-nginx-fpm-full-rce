@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["8.4.25", "8.4.26"]
+        version: ["8.2.34", "8.3.35", "8.4.0", "8.4.25", "8.4.26"]
     steps:
       - name: Check out
         uses: actions/checkout@v4

@@ -88,7 +88,7 @@ marker instead of trusting a version string).
 | Item | Value |
 | --- | --- |
 | Vulnerable builds | any release of the branches above, amd64, nginx + PHP-FPM |
-| Fixed builds | 8.2.35, 8.3.36, 8.4.27, 8.5.12 (8.4.27 checked with `patchcheck`) |
+| Fixed builds | 8.2.35, 8.3.36, 8.4.27, 8.5.12 (check any pair with `patchcheck --version <vulnerable>`) |
 | SAPI | `fpm` only |
 | Profiles | `profiles/<version>-fpm.json`; verified ones carry `"rce": true` |
 | Runtime proof | `uid=1000(...)` from `id` in the FPM worker |
@@ -292,7 +292,7 @@ target you can only reach with requests.
 | `no-oracle` | Full RCE without process memory | no | HTTP leak; no `/proc` fallback by default |
 | `endgame` | Oracle-calibrated full RCE | yes | local lab only |
 | `primitive` | Benign forged `var_entries`, observable via `app.php` | yes | useful calibration test |
-| `patchcheck` | Compare 8.4.26 and 8.4.27 | yes | proves the fixed build is clean |
+| `patchcheck` | Any vulnerable release vs its fixed counterpart | yes | registry derives the pair |
 | `chain` | Full pipeline (`primitive` or `endgame`) | yes | used by the lab runner |
 | `lifecycle` | Worker-death matrix | no | lab diagnostics |
 | `oracle` | Dump worker pid, bases, `d`, level | yes | lab diagnostics |
@@ -606,7 +606,7 @@ GitHub Actions is configured in `.github/workflows/`:
   - compiles Python and checks shell syntax;
   - runs the unit suite with schema validation.
 - **`live-fpm.yml`** — manual `workflow_dispatch`:
-  - matrix over PHP 8.4.25 and 8.4.26;
+  - matrix over every verified profile (8.2.34, 8.3.35, 8.4.0, 8.4.25, 8.4.26);
   - installs build dependencies and builds nginx/PHP from source;
   - starts the matching local lab;
   - enables `ptrace_scope=0` for the oracle test;

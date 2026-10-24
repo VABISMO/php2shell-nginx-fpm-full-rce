@@ -1,12 +1,12 @@
 [project]
 name = "php2shell-nginx-fpm-full-rce"
 version = "1.0.0"
-description = "PHP 8.4.25/8.4.26 nginx + PHP-FPM stale-unserialize RCE laboratory"
+description = "nginx + PHP-FPM stale-unserialize RCE laboratory (PHP 8.2-8.4 verified, session-file plant for PHP 5.4-7.x)"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-keywords = ["security", "research", "php", "php-fpm", "rce"]
+keywords = ["security", "research", "php", "php-fpm", "rce", "cve-2026-109619"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Information Technology",

