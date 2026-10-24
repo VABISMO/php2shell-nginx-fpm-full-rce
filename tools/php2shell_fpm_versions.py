@@ -41,6 +41,10 @@ BRANCHES: dict[str, dict] = {
     "7.4": {"fixed_in": None, "last_release": "7.4.33", "slot": 1},
     # EOL, never patched, and without php_session_cancel_decode: the
     # struct-freeing chain starts at 8.2, so these are plant targets
+    # session.upload_progress was introduced in 5.4: 5.0-5.3 have no attack
+    # surface at all, and 5.4/5.5/5.6 are plant targets (never patched)
+    "5.4": {"fixed_in": None, "last_release": "5.4.45", "slot": 9},
+    "5.5": {"fixed_in": None, "last_release": "5.5.38", "slot": 10},
     "5.6": {"fixed_in": None, "last_release": "5.6.40", "slot": 8},
     "8.0": {"fixed_in": None, "last_release": "8.0.30", "slot": 6},
     "8.1": {"fixed_in": None, "last_release": "8.1.33", "slot": 7},
@@ -53,6 +57,10 @@ BRANCHES: dict[str, dict] = {
 # Branches that are vulnerable and were never patched at all.  Listed for
 # documentation; every branch without a "fixed_in" release behaves the same.
 EOL_BRANCHES: tuple[str, ...] = ("5.x", "7.x", "8.0", "8.1")  # never patched
+
+# session.upload_progress exists from PHP 5.4 on, so 5.0-5.3 have no attack
+# surface for either chain of this advisory
+UPLOAD_PROGRESS_FROM = (5, 4)
 
 # The lab keeps the historical port assignment of the first three builds so
 # the documented URLs (README, CI) stay stable.

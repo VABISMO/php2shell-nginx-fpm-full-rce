@@ -78,7 +78,8 @@ memsets `BG(unserialize)`:
 | 8.4 | 8.4.0 – 8.4.26 | 8.4.27 | **verified profiles (8.4.0, 8.4.25, 8.4.26)** |
 | 8.3 | 8.3.0 – 8.3.35 | 8.3.36 | **verified profile (8.3.35)** |
 | 8.2 | 8.2.0 – 8.2.34 | 8.2.35 | **verified profile (8.2.34)** |
-| 8.1 and older (8.0, 7.x, 5.x) | every release | **never patched** | upstream bug present, but **this chain needs 8.2+** (see below) |
+| 8.1, 8.0, 7.x (all) | every release | **never patched** | upstream bug present, **this chain needs 8.2+**; `poison` applies (see below) |
+| 5.6, 5.5, 5.4 | every release | **never patched** | `upload_progress` exists from 5.4, so `poison` applies; 5.0-5.3 have no attack surface |
 
 `tools/php2shell_fpm_versions.py` is the single source of truth for that
 matrix: `is_vulnerable()`, `fixed_in()`, `affected_versions()`, and
