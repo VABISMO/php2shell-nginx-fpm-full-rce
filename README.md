@@ -78,7 +78,7 @@ memsets `BG(unserialize)`:
 | 8.4 | 8.4.0 – 8.4.26 | 8.4.27 | **verified profiles (8.4.0, 8.4.25, 8.4.26)** |
 | 8.3 | 8.3.0 – 8.3.35 | 8.3.36 | **verified profile (8.3.35)** |
 | 8.2 | 8.2.0 – 8.2.34 | 8.2.35 | **verified profile (8.2.34)** |
-| 8.1 and older (7.x, 5.x) | every release | **never patched** | upstream bug present, but **this chain needs 8.0+** (see below) |
+| 8.1 and older (8.0, 7.x, 5.x) | every release | **never patched** | upstream bug present, but **this chain needs 8.2+** (see below) |
 
 `tools/php2shell_fpm_versions.py` is the single source of truth for that
 matrix: `is_vulnerable()`, `fixed_in()`, `affected_versions()`, and
@@ -100,15 +100,17 @@ The verified profiles are Debian-style, user-prefix PHP builds compiled by
 needs its own offsets; `calibrate` derives them over HTTP (see
 [Remote calibration](#remote-calibration-of-any-version)).
 
-### PHP 7.x and why `no-oracle` needs 8.0+
+### PHP 8.1 and older and why `no-oracle` needs 8.2+
 
-PHP <= 7.x has no `php_session_cancel_decode()`: on a bailout the session
-decode state is never freed, so `BG(unserialize).data` keeps pointing at
-live memory and there is nothing for a later request to reclaim. The
+PHP 8.1 and older (8.0, 7.x, 5.x) have no `php_session_cancel_decode()`: on
+a bailout the session decode state is never freed, so
+`BG(unserialize).data` keeps pointing at live memory and there is nothing for
+a later request to reclaim. The function first appears in PHP **8.2**, which
+is what the registry checks. The
 `leak`, `primitive`, `endgame`, `chain`, `calibrate` and `no-oracle`
 commands refuse those builds with a clear message instead of pretending.
 
-The advisory exposure on 7.x is the other side of `session.upload_progress`,
+The advisory exposure on those branches is the other side of `session.upload_progress`,
 implemented here as `poison` (see
 [Session-file plant (PHP 5.4-8.x)](#session-file-plant-php-54-8x)).
 `php2shell_fpm_versions.has_session_cancel_decode()` reads that fact from the
@@ -287,7 +289,7 @@ target you can only reach with requests.
 | Command | Purpose | `/proc/<pid>/mem` | Notes |
 | --- | --- | --- | --- |
 | `calibrate` | Discover leak + reclaim geometry of any build | no | writes the profile; no arguments to feed |
-| `poison` | Session-file plant: chosen bytes into a chosen `sess_<sid>` | no | the chain that works on PHP <= 7.x |
+| `poison` | Session-file plant: chosen bytes into a chosen `sess_<sid>` | no | the chain for PHP <= 8.1 |
 | `leak` | Print chunk and PIE bases over HTTP | no | retries after worker death |
 | `no-oracle` | Full RCE without process memory | no | HTTP leak; no `/proc` fallback by default |
 | `endgame` | Oracle-calibrated full RCE | yes | local lab only |
@@ -501,7 +503,7 @@ files handler validates the session id (`php_session_valid_key`, only
 `[a-zA-Z0-9,-]`), which rules out path traversal. Turning the plant into code
 execution needs an application gadget or a local file include in the target —
 which is why PHP <= 7.x is reported as *session plant* and RCE is reserved
-for 8.0+, where the struct-freeing chain applies.
+for 8.2+, where the struct-freeing chain applies.
 
 ## HTTP-only base leak
 
@@ -799,7 +801,7 @@ shows the fixed build as clean.
 
 **Does it work on PHP 8.5.x?**<br>
 8.5.12 carries the fix. The chain does not depend on the branch —
-`calibrate` derives the geometry of any 8.0+ build over HTTP — but no 8.5
+`calibrate` derives the geometry of any 8.2+ build over HTTP — but no 8.5
 profile ships yet, so run `calibrate` against your build first.
 
 **Can I set the bases manually?**<br>

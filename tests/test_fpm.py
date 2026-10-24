@@ -323,12 +323,16 @@ class VersionRegistryTests(unittest.TestCase):
                 self.assertTrue(versions.is_vulnerable(version))
                 self.assertIsNone(versions.fixed_in(version))
 
-    def test_chain_requires_php_eight(self):
-        """PHP <= 7.x never frees the unserialize struct on the bailout."""
-        self.assertFalse(versions.chain_applies("7.2.34"))
-        self.assertFalse(versions.chain_applies("7.4.33"))
-        self.assertTrue(versions.chain_applies("8.0.0"))
-        self.assertTrue(versions.chain_applies("8.4.26"))
+    def test_chain_requires_php_82(self):
+        """php_session_cancel_decode only exists from PHP 8.2 on: before it
+        the bailout never frees the unserialize struct."""
+        for version in ("7.2.34", "7.4.33", "8.0.30", "8.1.33"):
+            with self.subTest(version=version):
+                self.assertFalse(versions.chain_applies(version))
+                self.assertTrue(versions.is_vulnerable(version))
+        for version in ("8.2.34", "8.3.35", "8.4.26"):
+            with self.subTest(version=version):
+                self.assertTrue(versions.chain_applies(version))
 
     def test_cancel_decode_detection_reads_the_source(self):
         source = ROOT / "lab" / "fpm" / "runtime" / "src"

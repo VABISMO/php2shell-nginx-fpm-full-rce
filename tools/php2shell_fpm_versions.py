@@ -39,6 +39,10 @@ VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 BRANCHES: dict[str, dict] = {
     "7.2": {"fixed_in": None, "last_release": "7.2.34", "slot": 0},
     "7.4": {"fixed_in": None, "last_release": "7.4.33", "slot": 1},
+    # EOL, never patched, and without php_session_cancel_decode: the
+    # struct-freeing chain starts at 8.2, so these are plant targets
+    "8.0": {"fixed_in": None, "last_release": "8.0.30", "slot": 6},
+    "8.1": {"fixed_in": None, "last_release": "8.1.33", "slot": 7},
     "8.2": {"fixed_in": "8.2.35", "last_release": "8.2.34", "slot": 2},
     "8.3": {"fixed_in": "8.3.36", "last_release": "8.3.35", "slot": 3},
     "8.4": {"fixed_in": "8.4.27", "last_release": "8.4.26", "slot": 4},
@@ -47,7 +51,7 @@ BRANCHES: dict[str, dict] = {
 
 # Branches that are vulnerable and were never patched at all.  Listed for
 # documentation; every branch without a "fixed_in" release behaves the same.
-EOL_BRANCHES: tuple[str, ...] = ("5.x", "7.x", "8.0", "8.1")
+EOL_BRANCHES: tuple[str, ...] = ("5.x", "7.x", "8.0", "8.1")  # never patched
 
 # The lab keeps the historical port assignment of the first three builds so
 # the documented URLs (README, CI) stay stable.
@@ -193,12 +197,13 @@ def has_session_cancel_decode(source: str) -> bool:
 def chain_applies(version: str) -> bool:
     """Whether this repository's chain can apply to a version at all.
 
-    The version string only tells the supported branches apart (8.0+); a
+    The version string only tells the supported branches apart (8.2+); a
     real build is classified with :func:`has_session_cancel_decode`, which
-    reads the source instead of trusting the version.
+    reads the source instead of trusting the version.  PHP 8.0 and 8.1 do
+    not have that function either, so they sit with 7.x on the plant side.
     """
     major, minor, _patch = parse(version)
-    return (major, minor) >= (8, 0)
+    return (major, minor) >= (8, 2)
 
 
 def build_status(binary: str) -> str:
