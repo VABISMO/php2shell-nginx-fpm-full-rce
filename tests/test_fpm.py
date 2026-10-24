@@ -541,9 +541,14 @@ class DocumentationConsistencyTests(unittest.TestCase):
             widths = {row.count("|") for row in block.strip().split("\n")}
             self.assertEqual(len(widths), 1, "misaligned markdown table")
 
+        # generated at build/run time: absent from a fresh checkout
+        generated = ("lab/fpm/runtime", "lab/fpm/webroot/out")
         for ref in sorted(set(re.findall(
                 r"`((?:tools|lab|profiles|tests)/[\w./-]+)`", text))):
-            self.assertTrue((ROOT / ref.rstrip("/")).exists(),
+            ref = ref.rstrip("/")
+            if ref.startswith(generated):
+                continue
+            self.assertTrue((ROOT / ref).exists(),
                             f"README references missing {ref}")
 
 
