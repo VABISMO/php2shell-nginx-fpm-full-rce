@@ -63,12 +63,19 @@ GROUP_NAME = subprocess.run(
 # patched branches up to (but excluding) the fixed one, plus the newest
 # release of the end-of-life branches upstream never fixed (7.2, 7.4).
 BRANCHES: tuple[tuple[str, int], ...] = (
+    # existing branches first: appending keeps every port assigned so far
     ("7.2", 34),
     ("7.4", 33),
     ("8.2", 34),
     ("8.3", 35),
     ("8.4", 26),
     ("8.5", 11),
+    # plant-only branches (no php_session_cancel_decode)
+    ("5.4", 45),
+    ("5.5", 38),
+    ("5.6", 40),
+    ("8.0", 30),
+    ("8.1", 33),
 )
 
 # version -> (chain_http, builder_http, chain_fpm, builder_fpm)
