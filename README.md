@@ -34,6 +34,7 @@ nginx security research, PHP session upload progress, exploitation laboratory.
 - [Verified output](#verified-output)
 - [Laboratory details](#laboratory-details)
 - [Profile and offsets](#profile-and-offsets)
+- [Remote calibration of any version](#remote-calibration-of-any-version)
 - [Session-file plant (PHP 5.4-8.x)](#session-file-plant-php-54-8x)
 - [HTTP-only base leak](#http-only-base-leak)
 - [Testing](#testing)
@@ -97,54 +98,22 @@ The verified profiles are Debian-style, user-prefix PHP builds compiled by
 needs its own offsets; `calibrate` derives them over HTTP (see
 [Remote calibration](#remote-calibration-of-any-version)).
 
-### Legacy branches (PHP 7.x) and why this chain stops at 8.0
+### PHP 7.x and why `no-oracle` needs 8.0+
 
-PHP 7.x never received a fix, so every 7.x release is vulnerable **to the
-upstream bug**, but this particular chain does not apply below PHP 8.0. The
-reason is in the source, and it was verified against a live 7.4.33 lab:
+PHP <= 7.x has no `php_session_cancel_decode()`: on a bailout the session
+decode state is never freed, so `BG(unserialize).data` keeps pointing at
+live memory and there is nothing for a later request to reclaim. The
+`leak`, `primitive`, `endgame`, `chain`, `calibrate` and `no-oracle`
+commands refuse those builds with a clear message instead of pretending.
 
-- **PHP >= 8.0** wraps the session decode in `zend_try/zend_catch` and calls
-  `php_session_cancel_decode()` -> `php_session_destroy()` on a bailout
-  (`ext/session/session.c`). That frees the `php_unserialize_data` struct
-  the OOM left behind, and the *freed* slot is what a later request
-  reclaims. `BG(unserialize).data` keeps pointing at it: that is the
-  use-after-free this repository exploits.
-- **PHP <= 7.x** has no `php_session_cancel_decode()` at all. The bailout
-  skips `PHP_VAR_UNSERIALIZE_DESTROY` and nothing frees the struct, so
-  `BG(unserialize).data` keeps pointing at *live* memory: `level=1` and a
-  valid `data` pointer are still set after the producer OOM (measured at
-  `BG+0xdc0/0xdc8` on 7.4.33), but there is no hole to fill.
-
-Without a freed struct there is no write primitive: the `var_entries` block
-and the zval `R:2` resolves to are both live, and forging them is what
-makes `pDestructor = zif_system` possible. The one thing that *is* freed on
-7.x is the session string itself (a read-only UAF), and it cannot be
-reclaimed either — the slot at `chunk+0x89800` was measured intact after
-upload buffers of every matching Zend-MM class (2016/2000/1992/4071/4000/8000
-bytes) and after ~600 shape/header combinations.
-
-The PHP 5.4-7.x exposure described by the advisory is the *other* side of
-`session.upload_progress`, and this repository implements it as the
-`poison` command (see [Session-file plant (PHP 5.4-8.x)](#session-file-plant-php-54-8x)).
-
-`php2shell_fpm_versions.has_session_cancel_decode()` detects this from the
+The advisory exposure on 7.x is the other side of `session.upload_progress`,
+implemented here as `poison` (see
+[Session-file plant (PHP 5.4-8.x)](#session-file-plant-php-54-8x)).
+`php2shell_fpm_versions.has_session_cancel_decode()` reads that fact from the
 source tree or a release tarball, and `php2shell_fpm_matrix.py` runs `poison`
-on such builds instead of reporting them as failures. The remaining
-7.x-specific support (the legacy five-pointer struct shape, the
-`_zval_ptr_dtor` symbol alias, and the glibc build fixes in
-`lab/fpm/build_php.sh`) is kept so the laboratory can still run 7.2/7.4 for
-comparisons.
-
-Everything else about 7.x is handled for you:
-
-- `lab/fpm/build_php.sh` fixes the two places 7.x mis-detects modern glibc
-  (the POSIX three-argument `readdir_r()` and the `fopencookie` seek
-  handler), so 7.2/7.4 build with a current toolchain;
-- the profile generator parses both struct shapes from the source tree and
-  records `"legacy": true` for the five-pointer one, and the payload builder
-  forges the matching structure (the fake `var_entries` starts at the head
-  of the reclaim buffer, which is also the block PHP 7's `var_destroy()`
-  frees).
+on those builds. `lab/fpm/build_php.sh` also fixes the two places 7.x
+mis-detect modern glibc (the POSIX three-argument `readdir_r()` and the
+`fopencookie` seek handler), so 7.2/7.4 build with a current toolchain.
 
 ## How the chain works
 
@@ -204,6 +173,7 @@ short-session string into an OOB read primitive for ASLR bases.
 ├── .github/workflows/         CI, live-lab and release workflows
 ├── lab/fpm/
 │   ├── build_php.sh           build PHP into lab/fpm/runtime (no root)
+│   ├── build_all.sh           build several versions at once
 │   ├── build_nginx.sh         build nginx into lab/fpm/runtime (no root)
 │   ├── nginx.conf.in          one nginx front for chain + builder pools
 │   ├── php-fpm.conf.in        chain (8M) and builder (64M) pools
@@ -213,22 +183,27 @@ short-session string into an OOB read primitive for ASLR bases.
 │       ├── index.php          health check
 │       ├── ref.php            creates `r` as a reference to `a`
 │       ├── bigvar.php         large stale-session arm page
-│       ├── leakvar.php        tunable stale-string research arm
+│       ├── leakvar.php        tunable stale-string arm page
 │       └── refb.php           benign short-session builder
 ├── profiles/
+│   ├── 8.2.34-fpm.json        verified offsets and heap geometry
+│   ├── 8.3.35-fpm.json        verified offsets and heap geometry
+│   ├── 8.4.0-fpm.json         verified offsets and heap geometry
 │   ├── 8.4.25-fpm.json        verified offsets and heap geometry
 │   ├── 8.4.26-fpm.json        verified offsets and heap geometry
 │   └── schema.json            profile validator
 ├── tests/test_fpm.py          unit + opt-in live tests
 ├── tools/
-│   ├── php2shell_fpm.py       exploit client
-│   ├── php2shell_fpm_profile.py  draft profile generator
+│   ├── php2shell_fpm.py       exploit client (leak, no-oracle, calibrate, poison)
+│   ├── php2shell_fpm_matrix.py  verify every unpatched build
+│   ├── php2shell_fpm_profile.py draft profile generator
+│   ├── php2shell_fpm_versions.py affected-version registry
+│   ├── php2shell_fpm_offsets.c  struct offsets compiled per build
 │   └── php2shell_fpm_labs.py  user-prefix nginx/FPM launcher
 ├── Makefile
 ├── requirements-dev.txt
 └── pyproject.toml
 ```
-
 ## Requirements
 
 - Linux **amd64** (the profile is verified on Debian-style builds).
@@ -309,7 +284,6 @@ target you can only reach with requests.
 | Command | Purpose | `/proc/<pid>/mem` | Notes |
 | --- | --- | --- | --- |
 | `calibrate` | Discover leak + reclaim geometry of any build | no | writes the profile; no arguments to feed |
-| `sweep` | Search the reclaim candidates of a build | no | keeps the profile leak geometry |
 | `poison` | Session-file plant: chosen bytes into a chosen `sess_<sid>` | no | the chain that works on PHP <= 7.x |
 | `leak` | Print chunk and PIE bases over HTTP | no | retries after worker death |
 | `no-oracle` | Full RCE without process memory | no | HTTP leak; no `/proc` fallback by default |
@@ -459,7 +433,7 @@ Three phases, each validated by the answer of the target:
    expose a chunk pointer and a PIE pointer at the *same* offsets. The chunk
    base is 2 MB aligned, which fixes `chunk_base_off` on its own.
 2. **Reclaim geometry** — the primitive (a forged `IS_LONG` zval reflected by
-   `app.php`) needs no PIE base, so it isolates the heap geometry: the sweep
+   `app.php`) needs no PIE base, so it isolates the heap geometry: the search
    walks pad/size shapes and `(chunk offset, content offset)` pairs until the
    value comes back in the response.
 3. **PIE base** — the leaked pointer is rounded down to 2 MB boundaries and
@@ -467,8 +441,7 @@ Three phases, each validated by the answer of the target:
    appears.
 
 The result is written into `profiles/<version>-fpm.json`, after which
-`no-oracle` reproduces the RCE against that build. `sweep` is the lighter
-variant: it keeps the leak geometry and only searches the reclaim candidates.
+`no-oracle` reproduces the RCE against that build.
 
 ## Session-file plant (PHP 5.4-8.x)
 
@@ -512,17 +485,10 @@ files handler validates the session id (`php_session_valid_key`, only
 code execution needs an application gadget or a local file include in the
 target.
 
-The remaining core-only route would be a memory-corruption primitive inside
-the upload-progress cycle itself. A PHP 7.2.34 build with
-`-fsanitize=address` (see `lab/fpm/build_php.sh 7.2.34-asan`, which honours
-`CFLAGS`) was driven through the documented sequences — progress uploads
-with and without a file part, multi-update bodies, alternating session ids —
-and AddressSanitizer reported **no** use-after-free or overflow. Together
-with the missing `php_session_cancel_decode()`, that is why this repository
-reports PHP <= 7.x as *session plant* and not as RCE.
-
-The `no-oracle` chain above is the one that reaches code execution with no
-application help, and it needs PHP >= 8.0.
+There is no core-only route to code execution on 7.x: the `php` serializer
+rejects keys containing `|`, the files handler validates the session id, and
+the struct-freeing chain needs PHP >= 8.0. That is why this repository
+reports PHP <= 7.x as *session plant* and reserves RCE for 8.0+.
 
 ## HTTP-only base leak
 

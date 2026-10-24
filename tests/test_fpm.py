@@ -374,35 +374,6 @@ class VersionRegistryTests(unittest.TestCase):
         self.assertFalse(versions.source_is_fixed(str(vulnerable)))
 
 
-class SymbolAliasTests(unittest.TestCase):
-    """PHP <= 7.2 exports the zval destructor as _zval_ptr_dtor."""
-
-    def test_underscore_alias_is_resolved(self):
-        nm = ("00000000001db5d0 t zif_system\n"
-              "0000000000282580 T _zval_ptr_dtor\n"
-              "000000000055a400 B basic_globals\n")
-        self.assertEqual(profile_gen.parse_nm(nm), {
-            "zif_system": 0x1DB5D0,
-            "zval_ptr_dtor": 0x282580,
-            "basic_globals": 0x55A400,
-        })
-
-    def test_missing_symbol_still_fails(self):
-        with self.assertRaisesRegex(ValueError, "missing symbols"):
-            profile_gen.parse_nm("00000000001db5d0 t zif_system\n")
-
-
-LEGACY_SOURCE = """\
-#define VAR_ENTRIES_MAX 1024
-struct php_unserialize_data {
-\tvoid *first;
-\tvoid *last;
-\tvoid *first_dtor;
-\tvoid *last_dtor;
-\tHashTable *allowed_classes;
-};
-"""
-
 MODERN_SOURCE = """\
 #define VAR_ENTRIES_MAX 1018
 struct php_unserialize_data {
@@ -432,78 +403,10 @@ class UnserializeLayoutTests(unittest.TestCase):
 
     def test_modern_shape_has_embedded_block(self):
         parsed = self._parse(MODERN_SOURCE)
-        self.assertFalse(parsed["legacy"])
         self.assertEqual(parsed["offsets"]["entries"], 56)
         self.assertEqual(parsed["size"], 56 + 16 + 8 * 1018)
         self.assertEqual(parsed["var_entries"]["data"], 16)
         self.assertEqual(parsed["var_entries"]["used_slots"], 0)
-
-    def test_legacy_shape_is_five_pointers(self):
-        parsed = self._parse(LEGACY_SOURCE)
-        self.assertTrue(parsed["legacy"])
-        self.assertEqual(parsed["size"], 40)
-        self.assertEqual(parsed["offsets"],
-                         {"first": 0, "last": 8, "first_dtor": 16,
-                          "last_dtor": 24, "allowed_classes": 32})
-        # data[] first, then used_slots, then next
-        self.assertEqual(parsed["var_entries"]["data"], 0)
-        self.assertEqual(parsed["var_entries"]["used_slots"], 8 * 1024)
-        self.assertEqual(parsed["var_entries"]["next"], 8 * 1024 + 8)
-
-    def test_built_74_layout_is_modern_and_72_is_legacy(self):
-        source = ROOT / "lab" / "fpm" / "runtime" / "src"
-        for version, legacy in (("7.2.34", True), ("7.4.33", False),
-                                ("8.4.26", False)):
-            tree = source / f"php-{version}"
-            if not tree.is_dir():
-                self.skipTest(f"{tree} is not extracted")
-            with self.subTest(version=version):
-                parsed = profile_gen.parse_unserialize_struct(str(tree))
-                self.assertEqual(parsed["legacy"], legacy)
-
-
-class LegacyPayloadTests(unittest.TestCase):
-    """PHP <= 7.3 payloads point first/last at the reclaim buffer itself."""
-
-    LAYOUT = {
-        "unserialize_data": {"first": 0, "last": 8, "first_dtor": 16,
-                             "last_dtor": 24, "allowed_classes": 32,
-                             "size": 40, "legacy": True},
-        "var_entries": {"data": 0, "used_slots": 8 * 1024,
-                        "next": 8 * 1024 + 8, "max": 1024},
-        "zval": {"value": 0, "type_info": 8, "size": 16},
-    }
-
-    def test_primitive_payload_forges_a_separate_block(self):
-        buf = fpm._build_primitive_payload(D, K, SIZE, 424242, self.LAYOUT)
-        buffer_start = D - K
-        self.assertEqual(struct.unpack_from("<Q", buf, K + 0)[0], buffer_start)
-        self.assertEqual(struct.unpack_from("<Q", buf, K + 8)[0], buffer_start)
-        self.assertEqual(struct.unpack_from("<Q", buf, K + 16)[0], 0)
-        self.assertEqual(struct.unpack_from("<Q", buf, K + 24)[0], 0)
-        # data[1] of the block that starts at the buffer head
-        self.assertEqual(struct.unpack_from("<Q", buf, 8)[0], D + 0x300)
-        self.assertEqual(struct.unpack_from("<q", buf, 8 * 1024)[0], 2)
-        self.assertEqual(struct.unpack_from("<I", buf, K + 0x308)[0], 4)
-
-    def test_legacy_payload_fits_the_buffer(self):
-        self.assertLessEqual(K + 8 * 1024 + 8, SIZE)
-
-
-class RemoteSweepTests(unittest.TestCase):
-    """The sweep discovers geometry without reading /proc."""
-
-    def test_grid_starts_from_the_profile_candidates(self):
-        grid = fpm._sweep_grid("8.4.26")
-        size, candidates, _pads = fpm._no_oracle_geometry("8.4.26")
-        self.assertEqual(grid[:len(candidates)],
-                         [(int(c[0]), int(c[1])) for c in candidates])
-        self.assertGreater(len(grid), len(candidates))
-
-    def test_grid_entries_are_unique(self):
-        grid = fpm._sweep_grid("8.4.25")
-        self.assertEqual(len(grid), len(set(grid)))
-
 
 
 class PoisonTests(unittest.TestCase):

