@@ -493,6 +493,16 @@ def up(only: set[str] | None, mode: str = "classic") -> None:
         [NGINX_BIN, "-p", NGINX_PREFIX, "-c", NGINX_CONF],
         capture_output=True, text=True,
     )
+    if (result.returncode != 0
+            # a running master keeps serving the previous configuration file,
+            # which silently breaks interleaved `up --only` runs: reload it so
+            # the freshly written server blocks become active
+            and read_pid(os.path.join(RUNTIME, "logs", "nginx.pid"))):
+        print("[*] nginx already running: reloading", flush=True)
+        result = subprocess.run(
+            [NGINX_BIN, "-p", NGINX_PREFIX, "-c", NGINX_CONF, "-s", "reload"],
+            capture_output=True, text=True,
+        )
     if result.returncode != 0:
         print(result.stderr)
         print("[!] nginx failed to start")
@@ -520,6 +530,15 @@ def down(only: set[str] | None = None) -> None:
             time.sleep(0.2)
         else:
             os.kill(nginx_pid, signal.SIGKILL)
+    # belt and suspenders: interleaved `up` runs have left orphan masters
+    # behind (the pidfile only tracks the newest one), so sweep every nginx
+    # started from THIS lab prefix before rebinding its ports
+    try:
+        subprocess.run(["pkill", "-f", f"{NGINX_PREFIX}/sbin/nginx"],
+                       capture_output=True)
+        time.sleep(0.5)
+    except OSError:
+        pass
     for version in select(only):
         pidfile = os.path.join(fpm_prefix(version), "logs", "fpm.pid")
         master = read_pid(pidfile)

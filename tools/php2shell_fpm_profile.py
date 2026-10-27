@@ -32,6 +32,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME = os.path.join(ROOT, "lab", "fpm", "runtime")
 SYMBOLS = ("zif_system", "zval_ptr_dtor", "basic_globals")
+# PHP <= 7.2 exports the zval destructor with a leading underscore.
+SYMBOL_ALIASES = {"zval_ptr_dtor": ("zval_ptr_dtor", "_zval_ptr_dtor")}
 OFFSETS_C = os.path.join(HERE, "php2shell_fpm_offsets.c")
 
 # branch -> first release that carries the fix.  PHP 8.1 and older (7.x
@@ -75,16 +77,21 @@ def parse_nm(text: str) -> dict[str, int]:
     prefixes the zval destructor with an underscore), so every alias of a
     symbol resolves to its canonical key.
     """
+    alias_map: dict[str, str] = {}
+    for canonical in SYMBOLS:
+        for alias in SYMBOL_ALIASES.get(canonical, (canonical,)):
+            alias_map[alias] = canonical
     found: dict[str, int] = {}
     for line in text.splitlines():
         parts = line.split()
         if len(parts) < 3:
             continue
         address, name = parts[0], parts[2]
-        if name not in SYMBOLS or name in found:
+        canonical = alias_map.get(name)
+        if canonical is None or canonical in found:
             continue
         try:
-            found[name] = int(address, 16)
+            found[canonical] = int(address, 16)
         except ValueError:
             continue
     missing = [name for name in SYMBOLS if name not in found]

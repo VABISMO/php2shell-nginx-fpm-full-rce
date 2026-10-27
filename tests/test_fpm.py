@@ -309,9 +309,9 @@ class FpmLabIntegrationTests(unittest.TestCase):
 class FpmLabPoisonTests(unittest.TestCase):
     """The session-file plant against a live build, over HTTP only.
 
-    PHP <= 8.1 targets are verified with this instead of the RCE chain:
-    the struct-freeing chain needs 8.2+, the plant works everywhere with
-    session.upload_progress.
+    The plant works on every version with session.upload_progress; the
+    branches the RCE chain does not cover (5.x, 7.2) are verified with it,
+    and it is re-checked here on a chain build as well.
     """
 
     def test_session_file_plant(self):
@@ -347,18 +347,21 @@ class VersionRegistryTests(unittest.TestCase):
                 self.assertTrue(versions.is_vulnerable(version))
                 self.assertIsNone(versions.fixed_in(version))
 
-    def test_chain_applies_from_php_80(self):
+    def test_chain_applies_from_php_74(self):
         """The stale BG(unserialize) struct is reclaimed on every branch
-        from PHP 8.0 on: php_var_unserialize_init reuses it whenever
+        from PHP 7.4 on: php_var_unserialize_init reuses it whenever
         level > 0, the Zend memory manager frees the emalloc block at
         request end, and php_session_cancel_decode (8.2+) only unlinks the
-        session file.  Verified end to end on 8.0.30 and 8.1.33; 5.x and
-        7.x keep the session-file plant until a chain run proves them."""
-        for version in ("5.4.45", "5.5.38", "5.6.40", "7.2.34", "7.4.33"):
+        session file.  Verified end to end (RCE over HTTP) on 7.4.33,
+        8.0.30 and 8.1.33; 7.2 arms but no reclaim shape covers its struct
+        yet, and 5.x has no zend_reference for the endgame payload - both
+        keep the session-file plant."""
+        for version in ("5.4.45", "5.5.38", "5.6.40", "7.2.34"):
             with self.subTest(version=version):
                 self.assertFalse(versions.chain_applies(version))
                 self.assertTrue(versions.is_vulnerable(version))
-        for version in ("8.0.30", "8.1.33", "8.2.34", "8.3.35", "8.4.26"):
+        for version in ("7.4.33", "8.0.30", "8.1.33", "8.2.34",
+                        "8.3.35", "8.4.26"):
             with self.subTest(version=version):
                 self.assertTrue(versions.chain_applies(version))
 

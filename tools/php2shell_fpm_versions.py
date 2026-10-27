@@ -185,10 +185,11 @@ def has_session_cancel_decode(source: str) -> bool:
     chain reclaims is *not* freed there: ``BG(unserialize).data`` is an
     emalloc block that the Zend memory manager releases at request end on
     every PHP version, and the reuse logic in ``php_var_unserialize_init``
-    predates 8.2 as well - so the chain applies from PHP 8.0 on (verified
-    end to end on 8.0.30 and 8.1.33).  This detector remains the marker
-    for the unlink side effect, which the rebuild-every-iteration logic
-    relies on: an 8.2+ arm destroys the session file, older builds keep it.
+    predates 8.2 as well - so the chain applies from PHP 7.4 on (verified
+    end to end on 7.4.33, 8.0.30 and 8.1.33).  This detector remains the
+    marker for the unlink side effect, which the
+    rebuild-every-iteration logic relies on: an 8.2+ arm destroys the
+    session file, older builds keep it.
     """
     if os.path.isdir(source):
         path = os.path.join(source, "ext", "session", "session.c")
@@ -210,20 +211,23 @@ def chain_applies(version: str) -> bool:
     """Whether this repository's chain can apply to a version at all.
 
     The stale ``BG(unserialize)`` state after a post-RINIT OOM is left
-    behind on every branch from PHP 8.0 up: ``php_var_unserialize_init``
+    behind on every branch from PHP 7.4 up: ``php_var_unserialize_init``
     reuses ``BG(unserialize).data`` whenever ``level > 0``, the Zend
     memory manager frees that emalloc block at request end, and
     ``php_session_cancel_decode`` (8.2+) only unlinks the session file -
-    it never touches the struct.  Verified end to end (RCE over HTTP) on
-    8.0.30, 8.1.33, 8.2.34, 8.3.35 and the 8.4/8.5 branches.  PHP 7.x and
-    5.x keep the session-file plant until a chain run proves them.
+    it never touches the struct.  Verified end to end (RCE over HTTP)
+    on 7.4.33, 8.0.30, 8.1.33, 8.2.34, 8.3.35 and the 8.4/8.5 branches.
+
+    7.2 arms the stale state too, but no reclaim shape covers the struct
+    on its allocator yet, so 7.2 and 5.x stay on the session-file plant
+    until a run proves them.
 
     A real build can still be classified with
     :func:`has_session_cancel_decode`, which reads the source instead of
     trusting the version.
     """
     major, minor, _patch = parse(version)
-    return (major, minor) >= (8, 0)
+    return (major, minor) >= (7, 4)
 
 
 def build_status(binary: str) -> str:

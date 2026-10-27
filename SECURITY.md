@@ -9,8 +9,8 @@ verified in [README.md](README.md):
 
 | Branch | Status in this repository |
 | --- | --- |
-| 8.0, 8.1, 8.2, 8.3, 8.4 (unpatched releases) | RCE chain, verified profiles (8.5.x: builds only, no profile yet) |
-| 5.4 – 5.6, 7.x | session-file plant, verified in the lab |
+| 7.4, 8.0, 8.1, 8.2, 8.3, 8.4 (unpatched releases) | RCE chain, verified profiles (8.5.x: builds only, no profile yet) |
+| 5.4 – 5.6, 7.2 | session-file plant, verified in the lab |
 | 8.2.35, 8.3.36, 8.4.27, 8.5.12 | patched upstream, cannot be exploited |
 | 5.0 – 5.3 | no `session.upload_progress`, no attack surface |
 

