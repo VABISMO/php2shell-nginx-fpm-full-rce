@@ -181,11 +181,14 @@ def has_session_cancel_decode(source: str) -> bool:
 
     ``php_session_decode`` wraps the serializer in ``zend_try/zend_catch``
     and calls ``php_session_cancel_decode()`` -> ``php_session_destroy()``,
-    which frees the ``php_unserialize_data`` struct the OOM left behind.
-    That freed slot is the one the chain reclaims.  PHP <= 7.x has no such
-    path: the bailout skips ``PHP_VAR_UNSERIALIZE_DESTROY`` and nothing
-    frees the struct, so ``BG(unserialize).data`` keeps pointing at live
-    memory and there is no use-after-free to exploit.
+    which unlinks the session file the OOM was decoding.  The struct the
+    chain reclaims is *not* freed there: ``BG(unserialize).data`` is an
+    emalloc block that the Zend memory manager releases at request end on
+    every PHP version, and the reuse logic in ``php_var_unserialize_init``
+    predates 8.2 as well - so the chain applies from PHP 8.0 on (verified
+    end to end on 8.0.30 and 8.1.33).  This detector remains the marker
+    for the unlink side effect, which the rebuild-every-iteration logic
+    relies on: an 8.2+ arm destroys the session file, older builds keep it.
     """
     if os.path.isdir(source):
         path = os.path.join(source, "ext", "session", "session.c")
@@ -206,13 +209,21 @@ def has_session_cancel_decode(source: str) -> bool:
 def chain_applies(version: str) -> bool:
     """Whether this repository's chain can apply to a version at all.
 
-    The version string only tells the supported branches apart (8.2+); a
-    real build is classified with :func:`has_session_cancel_decode`, which
-    reads the source instead of trusting the version.  PHP 8.0 and 8.1 do
-    not have that function either, so they sit with 7.x on the plant side.
+    The stale ``BG(unserialize)`` state after a post-RINIT OOM is left
+    behind on every branch from PHP 8.0 up: ``php_var_unserialize_init``
+    reuses ``BG(unserialize).data`` whenever ``level > 0``, the Zend
+    memory manager frees that emalloc block at request end, and
+    ``php_session_cancel_decode`` (8.2+) only unlinks the session file -
+    it never touches the struct.  Verified end to end (RCE over HTTP) on
+    8.0.30, 8.1.33, 8.2.34, 8.3.35 and the 8.4/8.5 branches.  PHP 7.x and
+    5.x keep the session-file plant until a chain run proves them.
+
+    A real build can still be classified with
+    :func:`has_session_cancel_decode`, which reads the source instead of
+    trusting the version.
     """
     major, minor, _patch = parse(version)
-    return (major, minor) >= (8, 2)
+    return (major, minor) >= (8, 0)
 
 
 def build_status(binary: str) -> str:

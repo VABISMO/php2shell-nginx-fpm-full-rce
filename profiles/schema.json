@@ -119,6 +119,32 @@
             "bases": {"type": "string"}
           },
           "additionalProperties": false
+        },
+        "growth": {
+          "type": "object",
+          "description": "geometry of the single-surface amplifier arm (default-installation mode); absent means the classic two-surface arm geometry applies",
+          "properties": {
+            "leak": {"$ref": "#/properties/fpm/properties/leak"},
+            "candidates": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": ["d_off", "k"],
+                "properties": {
+                  "d_off": {"type": "string", "pattern": "^0x[0-9a-fA-F]+$"},
+                  "k": {"type": "string", "pattern": "^0x[0-9a-fA-F]+$"}
+                },
+                "additionalProperties": false
+              }
+            },
+            "reclaim_pads": {
+              "type": "array",
+              "items": {"type": "integer", "minimum": 1}
+            },
+            "reclaim_size": {"type": "integer", "minimum": 1}
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false

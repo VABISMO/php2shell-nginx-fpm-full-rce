@@ -8,3 +8,4 @@ lab/fpm/webroot/out/
 *.egg-info/
 build/
 dist/
+lab/fpm/webroot/b
